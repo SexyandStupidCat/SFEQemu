@@ -127,6 +127,9 @@
 #include <libdrm/drm.h>
 #include <libdrm/i915_drm.h>
 #endif
+#include <lua.h>
+#include <lualib.h>
+#include <lauxlib.h>
 #include "linux_loop.h"
 #include "uname.h"
 
@@ -146,6 +149,22 @@
 #include "qapi/error.h"
 #include "fd-trans.h"
 #include "user/cpu_loop.h"
+
+/* External Lua state and rules path from main.c */
+extern lua_State *rules_lua_state;
+extern const char *rules_path;
+
+/* Global variable to store current CPU environment for Lua callbacks */
+static __thread CPUArchState *current_cpu_env = NULL;
+
+/* Forward declaration of do_syscall1 for Lua integration */
+abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
+                     abi_long arg2, abi_long arg3, abi_long arg4,
+                     abi_long arg5, abi_long arg6, abi_long arg7,
+                     abi_long arg8);
+
+/* Forward declaration for Lua syscall function registration */
+void init_lua_syscall_functions(lua_State *L);
 
 #ifndef CLONE_IO
 #define CLONE_IO                0x80000000      /* Clone io context */
@@ -9442,10 +9461,10 @@ _syscall5(int, sys_move_mount, int, __from_dfd, const char *, __from_pathname,
  * of syscall results, can be performed.
  * All errnos that do_syscall() returns must be -TARGET_<errcode>.
  */
-static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
-                            abi_long arg2, abi_long arg3, abi_long arg4,
-                            abi_long arg5, abi_long arg6, abi_long arg7,
-                            abi_long arg8)
+abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
+                     abi_long arg2, abi_long arg3, abi_long arg4,
+                     abi_long arg5, abi_long arg6, abi_long arg7,
+                     abi_long arg8)
 {
     CPUState *cpu = env_cpu(cpu_env);
     abi_long ret;
@@ -14131,6 +14150,423 @@ static abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
     return ret;
 }
 
+/*
+ * Lua C function: call original syscall
+ * This function is registered as c_do_syscall() in Lua
+ */
+static int lua_do_original_syscall(lua_State *L)
+{
+    int num;
+    abi_long arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8;
+    abi_long ret;
+
+    /* Check if current_cpu_env is set */
+    if (!current_cpu_env) {
+        lua_pushinteger(L, -1);
+        return 1;
+    }
+
+    /* Get arguments from Lua stack */
+    num = luaL_checkinteger(L, 1);
+    arg1 = luaL_optinteger(L, 2, 0);
+    arg2 = luaL_optinteger(L, 3, 0);
+    arg3 = luaL_optinteger(L, 4, 0);
+    arg4 = luaL_optinteger(L, 5, 0);
+    arg5 = luaL_optinteger(L, 6, 0);
+    arg6 = luaL_optinteger(L, 7, 0);
+    arg7 = luaL_optinteger(L, 8, 0);
+    arg8 = luaL_optinteger(L, 9, 0);
+
+    /* Call the original syscall implementation */
+    ret = do_syscall1(current_cpu_env, num, arg1, arg2, arg3, arg4,
+                      arg5, arg6, arg7, arg8);
+
+    /* Return the result to Lua */
+    lua_pushinteger(L, ret);
+    return 1;
+}
+
+/*
+ * Lua C function: g2h - guest to host address translation
+ * Usage: host_addr = c_g2h(guest_addr)
+ */
+static int lua_g2h(lua_State *L)
+{
+    abi_ulong guest_addr;
+    void *host_addr;
+
+    if (!current_cpu_env) {
+        lua_pushnil(L);
+        return 1;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+
+    /* Return host address as light userdata (pointer) */
+    lua_pushlightuserdata(L, host_addr);
+    return 1;
+}
+
+/*
+ * Lua C function: h2g - host to guest address translation
+ * Usage: guest_addr = c_h2g(host_addr)
+ */
+static int lua_h2g(lua_State *L)
+{
+    void *host_addr;
+    abi_ulong guest_addr;
+
+    host_addr = lua_touserdata(L, 1);
+    if (!host_addr) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+
+    if (!h2g_valid(host_addr)) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+
+    guest_addr = h2g(host_addr);
+    lua_pushinteger(L, guest_addr);
+    return 1;
+}
+
+/*
+ * Lua C function: read string from guest memory
+ * Usage: str = c_read_guest_string(guest_addr, max_len)
+ */
+static int lua_read_guest_string(lua_State *L)
+{
+    abi_ulong guest_addr;
+    int max_len;
+    char *host_addr;
+
+    if (!current_cpu_env) {
+        lua_pushstring(L, "");
+        return 1;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    max_len = luaL_optinteger(L, 2, 4096);
+
+    if (guest_addr == 0) {
+        lua_pushstring(L, "(null)");
+        return 1;
+    }
+
+    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+
+    /* Read string with length limit */
+    lua_pushlstring(L, host_addr, strnlen(host_addr, max_len));
+    return 1;
+}
+
+/*
+ * Lua C function: read 32-bit value from guest memory
+ * Usage: value = c_read_guest_u32(guest_addr)
+ */
+static int lua_read_guest_u32(lua_State *L)
+{
+    abi_ulong guest_addr;
+    uint32_t *host_addr;
+    uint32_t value;
+
+    if (!current_cpu_env) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+    value = *host_addr;
+
+    lua_pushinteger(L, value);
+    return 1;
+}
+
+/*
+ * Lua C function: read 64-bit value from guest memory
+ * Usage: value = c_read_guest_u64(guest_addr)
+ */
+static int lua_read_guest_u64(lua_State *L)
+{
+    abi_ulong guest_addr;
+    uint64_t *host_addr;
+    uint64_t value;
+
+    if (!current_cpu_env) {
+        lua_pushinteger(L, 0);
+        return 1;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+    value = *host_addr;
+
+    lua_pushinteger(L, value);
+    return 1;
+}
+
+/*
+ * Lua C function: write 32-bit value to guest memory
+ * Usage: c_write_guest_u32(guest_addr, value)
+ */
+static int lua_write_guest_u32(lua_State *L)
+{
+    abi_ulong guest_addr;
+    uint32_t value;
+    uint32_t *host_addr;
+
+    if (!current_cpu_env) {
+        return 0;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    value = luaL_checkinteger(L, 2);
+    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+    *host_addr = value;
+
+    return 0;
+}
+
+/*
+ * Lua C function: write 64-bit value to guest memory
+ * Usage: c_write_guest_u64(guest_addr, value)
+ */
+static int lua_write_guest_u64(lua_State *L)
+{
+    abi_ulong guest_addr;
+    uint64_t value;
+    uint64_t *host_addr;
+
+    if (!current_cpu_env) {
+        return 0;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    value = luaL_checkinteger(L, 2);
+    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+    *host_addr = value;
+
+    return 0;
+}
+
+/*
+ * Initialize Lua syscall integration
+ * Called once during rules_init() to register C functions
+ */
+void init_lua_syscall_functions(lua_State *L)
+{
+    if (L) {
+        /* Syscall execution */
+        lua_register(L, "c_do_syscall", lua_do_original_syscall);
+
+        /* Address translation */
+        lua_register(L, "c_g2h", lua_g2h);
+        lua_register(L, "c_h2g", lua_h2g);
+
+        /* Memory access functions */
+        lua_register(L, "c_read_guest_string", lua_read_guest_string);
+        lua_register(L, "c_read_guest_u32", lua_read_guest_u32);
+        lua_register(L, "c_read_guest_u64", lua_read_guest_u64);
+        lua_register(L, "c_write_guest_u32", lua_write_guest_u32);
+        lua_register(L, "c_write_guest_u64", lua_write_guest_u64);
+    }
+}
+
+/*
+ * Get syscall name from syscall number
+ * Returns the syscall name or NULL if not found
+ */
+static const char *get_syscall_name(int num)
+{
+    /* Define a simple mapping for common syscalls */
+    /* This is a basic implementation - extend as needed */
+    switch (num) {
+#ifdef TARGET_NR_read
+        case TARGET_NR_read: return "read";
+#endif
+#ifdef TARGET_NR_write
+        case TARGET_NR_write: return "write";
+#endif
+#ifdef TARGET_NR_open
+        case TARGET_NR_open: return "open";
+#endif
+#ifdef TARGET_NR_openat
+        case TARGET_NR_openat: return "openat";
+#endif
+#ifdef TARGET_NR_close
+        case TARGET_NR_close: return "close";
+#endif
+#ifdef TARGET_NR_stat
+        case TARGET_NR_stat: return "stat";
+#endif
+#ifdef TARGET_NR_fstat
+        case TARGET_NR_fstat: return "fstat";
+#endif
+#ifdef TARGET_NR_lstat
+        case TARGET_NR_lstat: return "lstat";
+#endif
+#ifdef TARGET_NR_poll
+        case TARGET_NR_poll: return "poll";
+#endif
+#ifdef TARGET_NR_lseek
+        case TARGET_NR_lseek: return "lseek";
+#endif
+#ifdef TARGET_NR_mmap
+        case TARGET_NR_mmap: return "mmap";
+#endif
+#ifdef TARGET_NR_mprotect
+        case TARGET_NR_mprotect: return "mprotect";
+#endif
+#ifdef TARGET_NR_munmap
+        case TARGET_NR_munmap: return "munmap";
+#endif
+#ifdef TARGET_NR_brk
+        case TARGET_NR_brk: return "brk";
+#endif
+#ifdef TARGET_NR_ioctl
+        case TARGET_NR_ioctl: return "ioctl";
+#endif
+#ifdef TARGET_NR_access
+        case TARGET_NR_access: return "access";
+#endif
+#ifdef TARGET_NR_execve
+        case TARGET_NR_execve: return "execve";
+#endif
+#ifdef TARGET_NR_exit
+        case TARGET_NR_exit: return "exit";
+#endif
+#ifdef TARGET_NR_fork
+        case TARGET_NR_fork: return "fork";
+#endif
+#ifdef TARGET_NR_clone
+        case TARGET_NR_clone: return "clone";
+#endif
+#ifdef TARGET_NR_getpid
+        case TARGET_NR_getpid: return "getpid";
+#endif
+#ifdef TARGET_NR_socket
+        case TARGET_NR_socket: return "socket";
+#endif
+#ifdef TARGET_NR_connect
+        case TARGET_NR_connect: return "connect";
+#endif
+#ifdef TARGET_NR_accept
+        case TARGET_NR_accept: return "accept";
+#endif
+#ifdef TARGET_NR_bind
+        case TARGET_NR_bind: return "bind";
+#endif
+#ifdef TARGET_NR_listen
+        case TARGET_NR_listen: return "listen";
+#endif
+        /* Add more syscalls as needed */
+        default: return NULL;
+    }
+}
+
+/*
+ * Execute Lua syscall hook if available
+ * Loads <rules_path>/<syscall_name>.lua on demand and executes it
+ * The Lua script can call c_do_syscall() to invoke the original syscall
+ * Returns:
+ *   0: Continue with normal syscall execution (no Lua script found)
+ *   1: Syscall was handled by Lua, ret contains the return value
+ */
+static int execute_lua_syscall_hook(CPUArchState *cpu_env, int num, abi_long *ret,
+                                     abi_long arg1, abi_long arg2, abi_long arg3,
+                                     abi_long arg4, abi_long arg5, abi_long arg6,
+                                     abi_long arg7, abi_long arg8)
+{
+    const char *syscall_name;
+    char lua_file_path[PATH_MAX];
+
+    /* Check if Lua state and rules path are initialized */
+    if (!rules_lua_state || !rules_path) {
+        return 0;
+    }
+
+    /* Get syscall name */
+    syscall_name = get_syscall_name(num);
+    if (!syscall_name) {
+        /* No name mapping for this syscall number */
+        return 0;
+    }
+
+    /* Build the file path: <rules_path>/<syscall_name>.lua */
+    snprintf(lua_file_path, sizeof(lua_file_path), "%s/%s.lua",
+             rules_path, syscall_name);
+
+    /* Check if file exists */
+    if (access(lua_file_path, F_OK) != 0) {
+        /* File doesn't exist, no hook for this syscall */
+        return 0;
+    }
+
+    /* Save current CPU environment for c_do_syscall */
+    current_cpu_env = cpu_env;
+
+    /* Load the Lua script */
+    if (luaL_loadfile(rules_lua_state, lua_file_path) != LUA_OK) {
+        fprintf(stderr, "Error loading Lua script '%s': %s\n",
+                lua_file_path, lua_tostring(rules_lua_state, -1));
+        lua_pop(rules_lua_state, 1);
+        current_cpu_env = NULL;
+        return 0;
+    }
+
+    /* Execute the script (this defines functions and runs top-level code) */
+    if (lua_pcall(rules_lua_state, 0, 0, 0) != LUA_OK) {
+        fprintf(stderr, "Error executing Lua script '%s': %s\n",
+                lua_file_path, lua_tostring(rules_lua_state, -1));
+        lua_pop(rules_lua_state, 1);
+        current_cpu_env = NULL;
+        return 0;
+    }
+
+    /* Get the do_syscall function from global scope */
+    lua_getglobal(rules_lua_state, "do_syscall");
+    if (!lua_isfunction(rules_lua_state, -1)) {
+        fprintf(stderr, "Warning: '%s' does not define do_syscall function\n",
+                lua_file_path);
+        lua_pop(rules_lua_state, 1);
+        current_cpu_env = NULL;
+        return 0;
+    }
+
+    /* Push arguments to Lua */
+    lua_pushinteger(rules_lua_state, num);
+    lua_pushinteger(rules_lua_state, arg1);
+    lua_pushinteger(rules_lua_state, arg2);
+    lua_pushinteger(rules_lua_state, arg3);
+    lua_pushinteger(rules_lua_state, arg4);
+    lua_pushinteger(rules_lua_state, arg5);
+    lua_pushinteger(rules_lua_state, arg6);
+    lua_pushinteger(rules_lua_state, arg7);
+    lua_pushinteger(rules_lua_state, arg8);
+
+    /* Call do_syscall function with 9 arguments, expecting 1 result */
+    if (lua_pcall(rules_lua_state, 9, 1, 0) != LUA_OK) {
+        fprintf(stderr, "Error calling do_syscall in %s.lua: %s\n",
+                syscall_name, lua_tostring(rules_lua_state, -1));
+        lua_pop(rules_lua_state, 1);
+        current_cpu_env = NULL;
+        return 0; /* Continue with normal execution on error */
+    }
+
+    /* Get the return value from Lua */
+    *ret = lua_tointeger(rules_lua_state, -1);
+    lua_pop(rules_lua_state, 1);
+
+    /* Clear current CPU environment */
+    current_cpu_env = NULL;
+
+    return 1; /* Syscall was handled by Lua */
+}
+
 static bool sys_dispatch(CPUState *cpu, TaskState *ts)
 {
     abi_ptr pc;
@@ -14198,6 +14634,22 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
         print_syscall(cpu_env, num, arg1, arg2, arg3, arg4, arg5, arg6);
     }
 
+    /* Check if there's a Lua hook for this syscall */
+    int lua_hook_result = execute_lua_syscall_hook(cpu_env, num, &ret,
+                                                     arg1, arg2, arg3, arg4,
+                                                     arg5, arg6, arg7, arg8);
+
+    if (lua_hook_result == 1) {
+        /* Syscall was handled by Lua script */
+        if (unlikely(qemu_loglevel_mask(LOG_STRACE))) {
+            print_syscall_ret(cpu_env, num, ret, arg1, arg2,
+                              arg3, arg4, arg5, arg6);
+        }
+        record_syscall_return(cpu, num, ret);
+        return ret;
+    }
+
+    /* No Lua script found, execute normal syscall */
     ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,
                       arg5, arg6, arg7, arg8);
 

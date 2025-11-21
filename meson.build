@@ -1441,6 +1441,34 @@ if host_os == 'linux' and (have_system or have_tools)
                        method: 'pkg-config',
                        required: get_option('libudev'))
 endif
+
+lua = not_found
+if not get_option('lua').auto() or have_linux_user
+  # Try to find lua with pkg-config, supporting multiple version names
+  lua = dependency('lua', version: '>=5.1',
+                   method: 'pkg-config',
+                   required: false)
+  if not lua.found()
+    lua = dependency('lua5.4', version: '>=5.1',
+                     method: 'pkg-config',
+                     required: false)
+  endif
+  if not lua.found()
+    lua = dependency('lua5.3', version: '>=5.1',
+                     method: 'pkg-config',
+                     required: false)
+  endif
+  if not lua.found()
+    lua = dependency('lua5.2', version: '>=5.1',
+                     method: 'pkg-config',
+                     required: false)
+  endif
+  if not lua.found()
+    lua = dependency('lua5.1', version: '>=5.1',
+                     method: 'pkg-config',
+                     required: get_option('lua'))
+  endif
+endif
 igvm = not_found
 if not get_option('igvm').auto() or have_system
   igvm = dependency('igvm', version: '>= 0.3.0',
@@ -2514,6 +2542,7 @@ config_host_data.set('CONFIG_LINUX', host_os == 'linux')
 config_host_data.set('CONFIG_POSIX', host_os != 'windows')
 config_host_data.set('CONFIG_WIN32', host_os == 'windows')
 config_host_data.set('CONFIG_LZO', lzo.found())
+config_host_data.set('CONFIG_LUA', lua.found())
 config_host_data.set('CONFIG_MPATH', mpathpersist.found())
 config_host_data.set('CONFIG_BLKIO', blkio.found())
 if blkio.found()
@@ -5012,6 +5041,7 @@ summary_info += {'TPM support':       have_tpm}
 summary_info += {'IGVM support':      igvm}
 summary_info += {'libssh support':    libssh}
 summary_info += {'lzo support':       lzo}
+summary_info += {'Lua support':       lua}
 summary_info += {'snappy support':    snappy}
 summary_info += {'bzip2 support':     libbzip2}
 summary_info += {'lzfse support':     liblzfse}

@@ -26,6 +26,10 @@
 #include <sys/resource.h>
 #include <sys/shm.h>
 #include <linux/binfmts.h>
+#include <dirent.h>
+#include <lua.h>
+#include <lualib.h>
+#include <lauxlib.h>
 
 #include "qapi/error.h"
 #include "qemu.h"
@@ -78,9 +82,16 @@ static envlist_t *envlist;
 static const char *cpu_model;
 static const char *cpu_type;
 static const char *seed_optarg;
+const char *rules_path = NULL;  /* Exported for syscall.c */
 unsigned long mmap_min_addr;
 uintptr_t guest_base;
 bool have_guest_base;
+
+/* Lua state for syscall rules */
+lua_State *rules_lua_state = NULL;  /* Exported for syscall.c */
+
+/* External function from syscall.c to initialize Lua syscall functions */
+void init_lua_syscall_functions(lua_State *L);
 
 /*
  * Used to implement backwards-compatibility for the `-strace`, and
@@ -342,6 +353,11 @@ static void handle_arg_seed(const char *arg)
     seed_optarg = arg;
 }
 
+static void handle_arg_rules(const char *arg)
+{
+    rules_path = strdup(arg);
+}
+
 static void handle_arg_gdb(const char *arg)
 {
     gdbstub = g_strdup(arg);
@@ -518,6 +534,8 @@ static const struct qemu_argument arg_table[] = {
      "",           "log system calls"},
     {"seed",       "QEMU_RAND_SEED",   true,  handle_arg_seed,
      "",           "Seed for pseudo-random number generator"},
+    {"rules",      "QEMU_RULES",       true,  handle_arg_rules,
+     "path",       "set the rules folder path"},
     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
      "",           "[[enable=]<pattern>][,events=<file>][,file=<file>]"},
 #ifdef CONFIG_PLUGIN
@@ -679,6 +697,79 @@ static int parse_args(int argc, char **argv)
     return optind;
 }
 
+
+/* C helper functions that can be called from Lua */
+
+/* Log message from Lua */
+static int lua_log_message(lua_State *L) {
+    const char *msg = luaL_checkstring(L, 1);
+    printf("[Lua Log] %s\n", msg);
+    return 0;
+}
+
+/* Get current timestamp */
+static int lua_get_timestamp(lua_State *L) {
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    lua_pushinteger(L, ts.tv_sec);
+    lua_pushinteger(L, ts.tv_nsec);
+    return 2;
+}
+
+/* Read a string from guest memory (limited to avoid crashes) */
+static int lua_read_guest_string(lua_State *L) {
+    /* This is a placeholder - actual implementation would need proper
+     * guest memory access functions from QEMU's user-mode infrastructure
+     * For now, just return a placeholder message */
+    lua_pushstring(L, "[Memory read not implemented in this example]");
+    return 1;
+}
+
+static void rules_init(const char *path) {
+    if (path == NULL) {
+        printf("Rules folder path: (not specified)\n");
+        return;
+    }
+
+    printf("Rules folder path: %s\n", path);
+
+    /* Check if directory exists */
+    DIR *dir = opendir(path);
+    if (dir == NULL) {
+        fprintf(stderr, "Failed to open rules directory '%s': %s\n",
+                path, strerror(errno));
+        return;
+    }
+    closedir(dir);
+
+    /* Initialize Lua state */
+    rules_lua_state = luaL_newstate();
+    if (rules_lua_state == NULL) {
+        fprintf(stderr, "Failed to create Lua state\n");
+        return;
+    }
+
+    /* Load standard Lua libraries */
+    luaL_openlibs(rules_lua_state);
+
+    /* Register C helper functions for Lua */
+    lua_register(rules_lua_state, "c_log", lua_log_message);
+    lua_register(rules_lua_state, "c_get_timestamp", lua_get_timestamp);
+    lua_register(rules_lua_state, "c_read_string", lua_read_guest_string);
+
+    /* Register syscall functions from syscall.c */
+    init_lua_syscall_functions(rules_lua_state);
+
+    printf("Lua environment initialized. Scripts will be loaded on demand.\n");
+}
+
+// static void rules_cleanup(void) {
+//     if (rules_lua_state != NULL) {
+//         lua_close(rules_lua_state);
+//         rules_lua_state = NULL;
+//     }
+// }
+
 int main(int argc, char **argv, char **envp)
 {
     struct image_info info1, *info = &info1;
@@ -735,6 +826,9 @@ int main(int argc, char **argv, char **envp)
     qemu_plugin_add_opts();
 
     optind = parse_args(argc, argv);
+
+    /* Initialize rules if specified */
+    rules_init(rules_path);
 
     qemu_set_log_filename_flags(last_log_filename,
                                 last_log_mask | (enable_strace * LOG_STRACE),

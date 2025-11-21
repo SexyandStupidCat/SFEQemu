@@ -23,6 +23,7 @@ linux_user_ss.add(files(
 ))
 linux_user_ss.add(rt)
 linux_user_ss.add(libdw)
+linux_user_ss.add(lua)
 
 linux_user_ss.add(when: 'TARGET_HAS_BFLT', if_true: files('flatload.c'))
 linux_user_ss.add(when: 'TARGET_I386', if_true: files('vm86.c'))

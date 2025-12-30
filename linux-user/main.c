@@ -25,8 +25,10 @@
 #include <sys/syscall.h>
 #include <sys/resource.h>
 #include <sys/shm.h>
+#include <sys/stat.h>
 #include <linux/binfmts.h>
 #include <dirent.h>
+#include <time.h>
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
@@ -89,6 +91,10 @@ bool have_guest_base;
 
 /* Lua state for syscall rules */
 lua_State *rules_lua_state = NULL;  /* Exported for syscall.c */
+
+/* Log file for Lua messages */
+static FILE *lua_log_file = NULL;
+static char lua_log_path[PATH_MAX];
 
 /* External function from syscall.c to initialize Lua syscall functions */
 void init_lua_syscall_functions(lua_State *L);
@@ -703,7 +709,25 @@ static int parse_args(int argc, char **argv)
 /* Log message from Lua */
 static int lua_log_message(lua_State *L) {
     const char *msg = luaL_checkstring(L, 1);
-    printf("[Lua Log] %s\n", msg);
+    time_t now;
+    struct tm *tm_info;
+    char timestamp[64];
+
+    /* Get current time */
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y-%m-%d %H:%M:%S", tm_info);
+
+    /* Output to stderr */
+    fprintf(stderr, "[Lua] %s\n", msg);
+    fflush(stderr);
+
+    /* Output to log file if opened */
+    if (lua_log_file != NULL) {
+        fprintf(lua_log_file, "[%s] %s\n", timestamp, msg);
+        fflush(lua_log_file);
+    }
+
     return 0;
 }
 
@@ -718,34 +742,98 @@ static int lua_get_timestamp(lua_State *L) {
 
 /* Read a string from guest memory (limited to avoid crashes) */
 static int lua_read_guest_string(lua_State *L) {
-    /* This is a placeholder - actual implementation would need proper
-     * guest memory access functions from QEMU's user-mode infrastructure
-     * For now, just return a placeholder message */
-    lua_pushstring(L, "[Memory read not implemented in this example]");
-    return 1;
+    abi_ulong guest_addr;
+    lua_Integer max_len_arg;
+    ssize_t max_len;
+    char *host_ptr;
+    size_t len;
+
+    guest_addr = luaL_checkinteger(L, 1);
+    max_len_arg = luaL_optinteger(L, 2, 4096);
+    if (max_len_arg <= 0 || max_len_arg > SSIZE_MAX) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    max_len = (ssize_t)max_len_arg;
+
+    if (guest_addr == 0) {
+        lua_pushstring(L, "(null)");
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+
+    host_ptr = lock_user(VERIFY_READ, guest_addr, max_len, 1);
+    if (!host_ptr) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, -TARGET_EFAULT);
+        return 2;
+    }
+
+    len = strnlen(host_ptr, max_len);
+    lua_pushlstring(L, host_ptr, len);
+    unlock_user(host_ptr, guest_addr, 0);
+
+    lua_pushinteger(L, 0);
+    return 2;
 }
 
 static void rules_init(const char *path) {
+    time_t now;
+    struct tm *tm_info;
+    char log_dir[PATH_MAX];
+    char timestamp[32];
+
     if (path == NULL) {
-        printf("Rules folder path: (not specified)\n");
+        fprintf(stderr, "Rules folder path: (not specified)\n");
+        fflush(stderr);
         return;
     }
 
-    printf("Rules folder path: %s\n", path);
+    fprintf(stderr, "Rules folder path: %s\n", path);
+    fflush(stderr);
 
     /* Check if directory exists */
     DIR *dir = opendir(path);
     if (dir == NULL) {
         fprintf(stderr, "Failed to open rules directory '%s': %s\n",
                 path, strerror(errno));
+        fflush(stderr);
         return;
     }
     closedir(dir);
+
+    /* Create log directory */
+    snprintf(log_dir, sizeof(log_dir), "log");
+    if (mkdir(log_dir, 0755) != 0 && errno != EEXIST) {
+        fprintf(stderr, "Warning: Failed to create log directory '%s': %s\n",
+                log_dir, strerror(errno));
+        fflush(stderr);
+    }
+
+    /* Generate log filename with timestamp */
+    time(&now);
+    tm_info = localtime(&now);
+    strftime(timestamp, sizeof(timestamp), "%Y%m%d_%H%M%S", tm_info);
+    snprintf(lua_log_path, sizeof(lua_log_path), "log/log_%s.log", timestamp);
+
+    /* Open log file */
+    lua_log_file = fopen(lua_log_path, "a");
+    if (lua_log_file != NULL) {
+        fprintf(stderr, "Lua log file: %s\n", lua_log_path);
+        fprintf(lua_log_file, "=== Lua log started at %s ===\n", timestamp);
+        fflush(lua_log_file);
+    } else {
+        fprintf(stderr, "Warning: Failed to open log file '%s': %s\n",
+                lua_log_path, strerror(errno));
+        fflush(stderr);
+    }
 
     /* Initialize Lua state */
     rules_lua_state = luaL_newstate();
     if (rules_lua_state == NULL) {
         fprintf(stderr, "Failed to create Lua state\n");
+        fflush(stderr);
         return;
     }
 
@@ -760,7 +848,8 @@ static void rules_init(const char *path) {
     /* Register syscall functions from syscall.c */
     init_lua_syscall_functions(rules_lua_state);
 
-    printf("Lua environment initialized. Scripts will be loaded on demand.\n");
+    fprintf(stderr, "Lua environment initialized. Scripts will be loaded on demand.\n");
+    fflush(stderr);
 }
 
 // static void rules_cleanup(void) {

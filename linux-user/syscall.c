@@ -134,6 +134,7 @@
 #include "uname.h"
 
 #include "qemu.h"
+#include "exec/gdbstub.h"
 #include "user-internals.h"
 #include "strace.h"
 #include "signal-common.h"
@@ -14186,6 +14187,228 @@ static int lua_do_original_syscall(lua_State *L)
     return 1;
 }
 
+static int find_gdb_regnum_by_name(CPUState *cpu, const char *name, int *out_regnum)
+{
+    int matches = 0;
+    int regnum = -1;
+    GArray *regs;
+
+    if (!name || !out_regnum) {
+        return -TARGET_EINVAL;
+    }
+
+    regs = gdb_get_register_list(cpu);
+    for (guint i = 0; i < regs->len; i++) {
+        const GDBRegDesc *desc = &g_array_index(regs, GDBRegDesc, i);
+        if (!desc->name) {
+            continue;
+        }
+        if (g_ascii_strcasecmp(desc->name, name) == 0) {
+            regnum = desc->gdb_reg;
+            matches++;
+            if (matches > 1) {
+                break;
+            }
+        }
+    }
+    g_array_free(regs, true);
+
+    if (matches == 1) {
+        *out_regnum = regnum;
+        return 0;
+    }
+
+    return -TARGET_EINVAL;
+}
+
+static int resolve_lua_regnum(lua_State *L, CPUState *cpu, int idx, int *out_regnum)
+{
+    if (lua_isinteger(L, idx)) {
+        lua_Integer v = lua_tointeger(L, idx);
+        if (v < 0 || v > INT_MAX) {
+            return -TARGET_EINVAL;
+        }
+        *out_regnum = (int)v;
+        return 0;
+    }
+
+    if (lua_isstring(L, idx)) {
+        const char *name = lua_tostring(L, idx);
+        return find_gdb_regnum_by_name(cpu, name, out_regnum);
+    }
+
+    return -TARGET_EINVAL;
+}
+
+/*
+ * Lua C 函数：列出当前 CPU 可通过 gdbstub 访问的寄存器
+ * 用法：regs = c_list_regs()
+ * 返回：数组，每项为 { num=..., name=..., feature=... }
+ */
+static int lua_list_regs(lua_State *L)
+{
+    CPUState *cpu;
+    GArray *regs;
+
+    if (!current_cpu_env) {
+        lua_newtable(L);
+        return 1;
+    }
+
+    cpu = env_cpu(current_cpu_env);
+    regs = gdb_get_register_list(cpu);
+
+    lua_newtable(L);
+    for (guint i = 0; i < regs->len; i++) {
+        const GDBRegDesc *desc = &g_array_index(regs, GDBRegDesc, i);
+
+        lua_newtable(L);
+        lua_pushinteger(L, desc->gdb_reg);
+        lua_setfield(L, -2, "num");
+        lua_pushstring(L, desc->name ? desc->name : "");
+        lua_setfield(L, -2, "name");
+        lua_pushstring(L, desc->feature_name ? desc->feature_name : "");
+        lua_setfield(L, -2, "feature");
+        lua_rawseti(L, -2, i + 1);
+    }
+
+    g_array_free(regs, true);
+    return 1;
+}
+
+/*
+ * Lua C 函数：读取寄存器（按名称或 gdb regnum）
+ * 用法：value, size, rc = c_get_reg("pc")  -- 或 c_get_reg(32)
+ * 说明：size <= 8 时 value 为整数；更大寄存器返回原始字节串（Lua string）
+ */
+static int lua_get_reg(lua_State *L)
+{
+    CPUState *cpu;
+    int regnum;
+    int reg_size;
+    int rc;
+    GByteArray *buf;
+
+    if (!current_cpu_env) {
+        lua_pushnil(L);
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 3;
+    }
+
+    cpu = env_cpu(current_cpu_env);
+    rc = resolve_lua_regnum(L, cpu, 1, &regnum);
+    if (rc) {
+        lua_pushnil(L);
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, rc);
+        return 3;
+    }
+
+    buf = g_byte_array_new();
+    reg_size = gdb_read_register(cpu, buf, regnum);
+    if (reg_size <= 0) {
+        g_byte_array_free(buf, true);
+        lua_pushnil(L);
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 3;
+    }
+
+    if (reg_size <= 8) {
+        uint64_t value = ldn_p(buf->data, reg_size);
+        lua_pushinteger(L, (lua_Integer)value);
+    } else {
+        lua_pushlstring(L, (const char *)buf->data, reg_size);
+    }
+    lua_pushinteger(L, reg_size);
+    lua_pushinteger(L, 0);
+
+    g_byte_array_free(buf, true);
+    return 3;
+}
+
+/*
+ * Lua C 函数：写入寄存器（按名称或 gdb regnum）
+ * 用法：bytes_written, rc = c_set_reg("x0", 0x1234)
+ *       bytes_written, rc = c_set_reg("v0", raw_bytes)
+ */
+static int lua_set_reg(lua_State *L)
+{
+    CPUState *cpu;
+    int regnum;
+    int rc;
+    int reg_size;
+    int buf_len;
+    int written;
+    GByteArray *tmp;
+    uint8_t *mem_buf;
+
+    if (!current_cpu_env) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
+    }
+
+    cpu = env_cpu(current_cpu_env);
+    rc = resolve_lua_regnum(L, cpu, 1, &regnum);
+    if (rc) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, rc);
+        return 2;
+    }
+
+    tmp = g_byte_array_new();
+    reg_size = gdb_read_register(cpu, tmp, regnum);
+    g_byte_array_free(tmp, true);
+    if (reg_size <= 0) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+
+    buf_len = MAX(reg_size, (int)sizeof(target_ulong));
+    mem_buf = g_malloc0(buf_len);
+
+    if (lua_isinteger(L, 2)) {
+        uint64_t value = (uint64_t)lua_tointeger(L, 2);
+        if (reg_size != 1 && reg_size != 2 && reg_size != 4 && reg_size != 8) {
+            g_free(mem_buf);
+            lua_pushinteger(L, 0);
+            lua_pushinteger(L, -TARGET_EINVAL);
+            return 2;
+        }
+        stn_p(mem_buf, reg_size, value);
+    } else if (lua_isstring(L, 2)) {
+        size_t len;
+        const char *bytes = lua_tolstring(L, 2, &len);
+        if (len != reg_size && len != (size_t)buf_len) {
+            g_free(mem_buf);
+            lua_pushinteger(L, 0);
+            lua_pushinteger(L, -TARGET_EINVAL);
+            return 2;
+        }
+        memcpy(mem_buf, bytes, MIN((size_t)buf_len, len));
+    } else {
+        g_free(mem_buf);
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+
+    written = gdb_write_register(cpu, mem_buf, regnum);
+    g_free(mem_buf);
+    if (written <= 0) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+
+    lua_pushinteger(L, written);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
 /*
  * Lua C function: g2h - guest to host address translation
  * Usage: host_addr = c_g2h(guest_addr)
@@ -14240,27 +14463,48 @@ static int lua_h2g(lua_State *L)
 static int lua_read_guest_string(lua_State *L)
 {
     abi_ulong guest_addr;
-    int max_len;
-    char *host_addr;
-
+    lua_Integer max_len_arg;
+    ssize_t max_len;
+    char *host_ptr;
+    size_t len;
+    abi_long rc = 0;
     if (!current_cpu_env) {
         lua_pushstring(L, "");
-        return 1;
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
     }
 
     guest_addr = luaL_checkinteger(L, 1);
-    max_len = luaL_optinteger(L, 2, 4096);
+    printf("%lx\n", (long)guest_addr);
+
+    max_len_arg = luaL_optinteger(L, 2, 4096);
+    if (max_len_arg <= 0 || max_len_arg > SSIZE_MAX) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    max_len = (ssize_t)max_len_arg;
 
     if (guest_addr == 0) {
         lua_pushstring(L, "(null)");
-        return 1;
+        lua_pushinteger(L, 0);
+        return 2;
     }
 
-    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
+    host_ptr = lock_user(VERIFY_READ, guest_addr, max_len, 1);
+    if (!host_ptr) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, -TARGET_EFAULT);
+        return 2;
+    }
 
     /* Read string with length limit */
-    lua_pushlstring(L, host_addr, strnlen(host_addr, max_len));
-    return 1;
+    len = strnlen(host_ptr, max_len);
+    lua_pushlstring(L, host_ptr, len);
+    unlock_user(host_ptr, guest_addr, 0);
+
+    lua_pushinteger(L, rc);
+    return 2;
 }
 
 /*
@@ -14270,20 +14514,26 @@ static int lua_read_guest_string(lua_State *L)
 static int lua_read_guest_u32(lua_State *L)
 {
     abi_ulong guest_addr;
-    uint32_t *host_addr;
     uint32_t value;
+    abi_long rc;
 
     if (!current_cpu_env) {
         lua_pushinteger(L, 0);
-        return 1;
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
     }
 
     guest_addr = luaL_checkinteger(L, 1);
-    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
-    value = *host_addr;
+    rc = get_user_u32(value, guest_addr);
+    if (rc) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, rc);
+        return 2;
+    }
 
     lua_pushinteger(L, value);
-    return 1;
+    lua_pushinteger(L, 0);
+    return 2;
 }
 
 /*
@@ -14293,20 +14543,26 @@ static int lua_read_guest_u32(lua_State *L)
 static int lua_read_guest_u64(lua_State *L)
 {
     abi_ulong guest_addr;
-    uint64_t *host_addr;
     uint64_t value;
+    abi_long rc;
 
     if (!current_cpu_env) {
         lua_pushinteger(L, 0);
-        return 1;
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
     }
 
     guest_addr = luaL_checkinteger(L, 1);
-    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
-    value = *host_addr;
+    rc = get_user_u64(value, guest_addr);
+    if (rc) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, rc);
+        return 2;
+    }
 
     lua_pushinteger(L, value);
-    return 1;
+    lua_pushinteger(L, 0);
+    return 2;
 }
 
 /*
@@ -14317,18 +14573,19 @@ static int lua_write_guest_u32(lua_State *L)
 {
     abi_ulong guest_addr;
     uint32_t value;
-    uint32_t *host_addr;
+    abi_long rc;
 
     if (!current_cpu_env) {
-        return 0;
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 1;
     }
 
     guest_addr = luaL_checkinteger(L, 1);
     value = luaL_checkinteger(L, 2);
-    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
-    *host_addr = value;
+    rc = put_user_u32(value, guest_addr);
+    lua_pushinteger(L, rc);
 
-    return 0;
+    return 1;
 }
 
 /*
@@ -14339,18 +14596,113 @@ static int lua_write_guest_u64(lua_State *L)
 {
     abi_ulong guest_addr;
     uint64_t value;
-    uint64_t *host_addr;
+    abi_long rc;
 
     if (!current_cpu_env) {
-        return 0;
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 1;
     }
 
     guest_addr = luaL_checkinteger(L, 1);
     value = luaL_checkinteger(L, 2);
-    host_addr = g2h(env_cpu(current_cpu_env), guest_addr);
-    *host_addr = value;
+    rc = put_user_u64(value, guest_addr);
+    lua_pushinteger(L, rc);
 
-    return 0;
+    return 1;
+}
+
+/*
+ * Lua C 函数：从 guest 内存读取指定长度的字节
+ * 用法：data, rc = c_read_guest_bytes(guest_addr, len)
+ * 别名：c_read_bytes
+ */
+static int lua_read_guest_bytes(lua_State *L)
+{
+    abi_ulong guest_addr;
+    lua_Integer len_arg;
+    ssize_t len;
+    char *buf;
+    abi_long rc;
+
+    if (!current_cpu_env) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    len_arg = luaL_checkinteger(L, 2);
+    if (len_arg < 0 || len_arg > SSIZE_MAX) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    len = (ssize_t)len_arg;
+
+    if (len == 0) {
+        lua_pushstring(L, "");
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+
+    buf = g_malloc(len);
+    rc = copy_from_user(buf, guest_addr, len);
+    if (rc) {
+        g_free(buf);
+        lua_pushstring(L, "");
+        lua_pushinteger(L, rc);
+        return 2;
+    }
+
+    lua_pushlstring(L, buf, len);
+    g_free(buf);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+/*
+ * Lua C 函数：向 guest 内存写入字节串
+ * 用法：bytes_written, rc = c_write_guest_bytes(guest_addr, data)
+ * 别名：c_write_bytes
+ */
+static int lua_write_guest_bytes(lua_State *L)
+{
+    abi_ulong guest_addr;
+    size_t len;
+    const char *buf;
+    abi_long rc;
+
+    if (!current_cpu_env) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
+    }
+
+    guest_addr = luaL_checkinteger(L, 1);
+    buf = luaL_checklstring(L, 2, &len);
+
+    if (len > SSIZE_MAX) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+
+    if (len == 0) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+
+    rc = copy_to_user(guest_addr, (void *)buf, (ssize_t)len);
+    if (rc) {
+        lua_pushinteger(L, 0);
+        lua_pushinteger(L, rc);
+        return 2;
+    }
+
+    lua_pushinteger(L, (lua_Integer)len);
+    lua_pushinteger(L, 0);
+    return 2;
 }
 
 /*
@@ -14363,6 +14715,11 @@ void init_lua_syscall_functions(lua_State *L)
         /* Syscall execution */
         lua_register(L, "c_do_syscall", lua_do_original_syscall);
 
+        /* CPU registers */
+        lua_register(L, "c_list_regs", lua_list_regs);
+        lua_register(L, "c_get_reg", lua_get_reg);
+        lua_register(L, "c_set_reg", lua_set_reg);
+
         /* Address translation */
         lua_register(L, "c_g2h", lua_g2h);
         lua_register(L, "c_h2g", lua_h2g);
@@ -14373,6 +14730,10 @@ void init_lua_syscall_functions(lua_State *L)
         lua_register(L, "c_read_guest_u64", lua_read_guest_u64);
         lua_register(L, "c_write_guest_u32", lua_write_guest_u32);
         lua_register(L, "c_write_guest_u64", lua_write_guest_u64);
+        lua_register(L, "c_read_guest_bytes", lua_read_guest_bytes);
+        lua_register(L, "c_write_guest_bytes", lua_write_guest_bytes);
+        lua_register(L, "c_read_bytes", lua_read_guest_bytes);
+        lua_register(L, "c_write_bytes", lua_write_guest_bytes);
     }
 }
 
@@ -14548,8 +14909,8 @@ static int execute_lua_syscall_hook(CPUArchState *cpu_env, int num, abi_long *re
     lua_pushinteger(rules_lua_state, arg7);
     lua_pushinteger(rules_lua_state, arg8);
 
-    /* Call do_syscall function with 9 arguments, expecting 1 result */
-    if (lua_pcall(rules_lua_state, 9, 1, 0) != LUA_OK) {
+    /* Call do_syscall function with 9 arguments, expecting 2 results */
+    if (lua_pcall(rules_lua_state, 9, 2, 0) != LUA_OK) {
         fprintf(stderr, "Error calling do_syscall in %s.lua: %s\n",
                 syscall_name, lua_tostring(rules_lua_state, -1));
         lua_pop(rules_lua_state, 1);
@@ -14557,14 +14918,28 @@ static int execute_lua_syscall_hook(CPUArchState *cpu_env, int num, abi_long *re
         return 0; /* Continue with normal execution on error */
     }
 
-    /* Get the return value from Lua */
-    *ret = lua_tointeger(rules_lua_state, -1);
-    lua_pop(rules_lua_state, 1);
+    /* Get the return values from Lua
+     * Lua should return: (intercept_flag, return_value)
+     * - intercept_flag: 0 = let original syscall run, 1 = intercept and use return_value
+     * - return_value: the value to return if intercepting
+     */
+    int intercept = 0;
+    if (lua_gettop(rules_lua_state) >= 2) {
+        /* Two return values: (intercept, ret) */
+        intercept = lua_tointeger(rules_lua_state, -2);
+        *ret = lua_tointeger(rules_lua_state, -1);
+        lua_pop(rules_lua_state, 2);
+    } else if (lua_gettop(rules_lua_state) >= 1) {
+        /* Single return value for backwards compatibility: treat as intercept flag only */
+        intercept = lua_tointeger(rules_lua_state, -1);
+        *ret = 0;
+        lua_pop(rules_lua_state, 1);
+    }
 
     /* Clear current CPU environment */
     current_cpu_env = NULL;
 
-    return 1; /* Syscall was handled by Lua */
+    return intercept; /* 1 = intercept, 0 = let original syscall run */
 }
 
 static bool sys_dispatch(CPUState *cpu, TaskState *ts)

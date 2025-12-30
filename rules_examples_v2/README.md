@@ -237,12 +237,17 @@ local guest_addr = c_h2g(host_addr)
 - `max_len`: 最大长度（可选，默认4096）
 
 **返回：**
-- 字符串内容
+- `content, rc`
+  - `content`: 字符串内容
+  - `rc`: 0 表示成功，负数表示错误码（如 `-EFAULT`）
 
 **示例：**
 ```lua
 -- 读取write系统调用的缓冲区内容
-local content = c_read_guest_string(buf, count)
+local content, rc = c_read_guest_string(buf, count)
+if rc ~= 0 then
+    c_log(string.format("read_guest_string failed: %d", rc))
+end
 c_log(string.format("Writing: '%s'", content))
 ```
 
@@ -253,11 +258,16 @@ c_log(string.format("Writing: '%s'", content))
 - `guest_addr`: 客户机地址（整数）
 
 **返回：**
-- 32位整数值
+- `value, rc`
+  - `value`: 32位整数值（失败时为0）
+  - `rc`: 0 表示成功，负数表示错误码
 
 **示例：**
 ```lua
-local value = c_read_guest_u32(addr)
+local value, rc = c_read_guest_u32(addr)
+if rc ~= 0 then
+    c_log(string.format("read_guest_u32 failed: %d", rc))
+end
 c_log(string.format("u32 value: 0x%08x", value))
 ```
 
@@ -268,11 +278,16 @@ c_log(string.format("u32 value: 0x%08x", value))
 - `guest_addr`: 客户机地址（整数）
 
 **返回：**
-- 64位整数值
+- `value, rc`
+  - `value`: 64位整数值（失败时为0）
+  - `rc`: 0 表示成功，负数表示错误码
 
 **示例：**
 ```lua
-local value = c_read_guest_u64(addr)
+local value, rc = c_read_guest_u64(addr)
+if rc ~= 0 then
+    c_log(string.format("read_guest_u64 failed: %d", rc))
+end
 c_log(string.format("u64 value: 0x%016x", value))
 ```
 
@@ -285,9 +300,15 @@ c_log(string.format("u64 value: 0x%016x", value))
 - `guest_addr`: 客户机地址（整数）
 - `value`: 要写入的32位整数
 
+**返回：**
+- `rc`: 0 表示成功，负数表示错误码
+
 **示例：**
 ```lua
-c_write_guest_u32(addr, 0x12345678)
+local rc = c_write_guest_u32(addr, 0x12345678)
+if rc ~= 0 then
+    c_log(string.format("write_guest_u32 failed: %d", rc))
+end
 ```
 
 #### c_write_guest_u64(guest_addr, value)
@@ -297,9 +318,120 @@ c_write_guest_u32(addr, 0x12345678)
 - `guest_addr`: 客户机地址（整数）
 - `value`: 要写入的64位整数
 
+**返回：**
+- `rc`: 0 表示成功，负数表示错误码
+
 **示例：**
 ```lua
-c_write_guest_u64(addr, 0x123456789abcdef0)
+local rc = c_write_guest_u64(addr, 0x123456789abcdef0)
+if rc ~= 0 then
+    c_log(string.format("write_guest_u64 failed: %d", rc))
+end
+```
+
+### 内存读写（字节）
+
+#### c_read_guest_bytes(guest_addr, len)
+从客户机内存读取指定长度的字节
+
+**参数：**
+- `guest_addr`: 客户机地址（整数）
+- `len`: 读取长度（整数）
+
+**返回：**
+- `data, rc`
+  - `data`: Lua 字符串（可包含 `\\0`）
+  - `rc`: 0 表示成功，负数表示错误码
+
+**别名：**
+- `c_read_bytes(guest_addr, len)`
+
+**示例：**
+```lua
+local data, rc = c_read_guest_bytes(buf, count)
+if rc == 0 then
+    c_log(string.format("read %d bytes", #data))
+end
+```
+
+#### c_write_guest_bytes(guest_addr, data)
+向客户机内存写入字节串
+
+**参数：**
+- `guest_addr`: 客户机地址（整数）
+- `data`: Lua 字符串（可包含 `\\0`）
+
+**返回：**
+- `bytes_written, rc`
+  - `bytes_written`: 成功写入的字节数（失败时为0）
+  - `rc`: 0 表示成功，负数表示错误码
+
+**别名：**
+- `c_write_bytes(guest_addr, data)`
+
+**示例：**
+```lua
+local n, rc = c_write_guest_bytes(buf, "hello\\0")
+if rc ~= 0 then
+    c_log(string.format("write_guest_bytes failed: %d", rc))
+end
+```
+
+### 寄存器访问
+
+#### c_list_regs()
+列出当前 CPU 可用的寄存器列表（来自 gdbstub 的寄存器描述）
+
+**返回：**
+- `regs`: 数组，每项为 `{ num=..., name=..., feature=... }`
+
+**示例：**
+```lua
+for i, r in ipairs(c_list_regs()) do
+    c_log(string.format("reg[%d] %s = %d (%s)", i, r.name, r.num, r.feature))
+end
+```
+
+#### c_get_reg(name_or_num)
+读取寄存器值
+
+**参数：**
+- `name_or_num`: 寄存器名（字符串，如 `\"pc\"`、`\"x0\"`、`\"rax\"`）或 gdb regnum（整数）
+
+**返回：**
+- `value, size, rc`
+  - `value`: `size <= 8` 时为整数；更大寄存器返回原始字节串（Lua string）
+  - `size`: 寄存器字节数
+  - `rc`: 0 表示成功，负数表示错误码
+
+**示例：**
+```lua
+local val, size, rc = c_get_reg("pc")
+if rc == 0 then
+    c_log(string.format("pc(size=%d) = 0x%x", size, val))
+end
+```
+
+#### c_set_reg(name_or_num, value_or_bytes)
+写入寄存器值
+
+**参数：**
+- `name_or_num`: 寄存器名或 gdb regnum
+- `value_or_bytes`:
+  - 标量寄存器可传整数（将按寄存器宽度写入）
+  - 大寄存器可传字节串（长度需匹配寄存器大小）
+
+**返回：**
+- `bytes_written, rc`
+  - `bytes_written`: 写入的字节数（失败时为0）
+  - `rc`: 0 表示成功，负数表示错误码
+
+**示例：**
+```lua
+local n, rc = c_set_reg("x0", 0x1234)
+if rc ~= 0 then
+    c_log(string.format("set_reg failed: %d", rc))
+end
 ```
 
 ## 高级技巧

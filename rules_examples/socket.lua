@@ -1,5 +1,5 @@
 -- socket.lua - Hook for socket syscall
--- This script monitors socket creation
+-- This script monitors socket creation and logs parameters
 
 -- Socket domain constants
 local AF_UNIX = 1
@@ -27,15 +27,10 @@ function do_syscall(num, domain, type, protocol, arg4, arg5, arg6, arg7, arg8)
     local domain_str = domain_names[domain] or string.format("UNKNOWN(%d)", domain)
     local type_str = type_names[type] or string.format("UNKNOWN(%d)", type)
 
-    c_log(string.format("socket(%s, %s, %d)", domain_str, type_str, protocol))
+    -- 打印并记录 socket 参数
+    c_log(string.format("[socket] domain=%s, type=%s, protocol=%d", domain_str, type_str, protocol))
 
-    -- Block raw sockets (example)
-    if type == SOCK_RAW then
-        c_log("  -> Blocked attempt to create raw socket!")
-        return 1, -1  -- Return error
-    end
-
-    -- Continue with normal execution
+    -- 继续正常执行
     return 0, 0
 end
 

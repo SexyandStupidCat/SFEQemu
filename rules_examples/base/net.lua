@@ -127,12 +127,31 @@ function M.read_ifname(ifreq_addr)
     return nil
 end
 
+-- 不存在的接口映射到真实接口
+M.INTERFACE_MAPPING = {
+    ["br0"] = "eth0",      -- br0 -> eth0
+    ["br1"] = "eth0",      -- br1 -> eth0
+    ["wlan0"] = "eth0",    -- wlan0 -> eth0
+}
+
 -- 检查是否应该拦截此接口的请求
 -- @param ifname: 接口名称
--- @return true 表示应该拦截并返回模拟数据
+-- @return should_intercept, real_ifname
 function M.should_intercept(ifname)
-    -- 只拦截 eth0 的请求
-    return ifname == M.NET_CONFIG.INTERFACE_NAME
+    -- 如果请求的是 eth0，直接放行让真实系统调用处理
+    if ifname == M.NET_CONFIG.INTERFACE_NAME then
+        return false, ifname
+    end
+
+    -- 如果请求的接口在映射表中（不存在的接口），拦截并返回 eth0 的信息
+    if M.INTERFACE_MAPPING[ifname] then
+        c_log(string.format("[net] Mapping non-existent interface %s -> %s",
+            ifname, M.INTERFACE_MAPPING[ifname]))
+        return true, M.INTERFACE_MAPPING[ifname]
+    end
+
+    -- 其他接口不拦截
+    return false, ifname
 end
 
 -- 处理网络接口 ioctl 请求并写入模拟数据
@@ -153,10 +172,14 @@ function M.handle_ioctl(cmd, ifreq_addr)
     end
 
     -- 检查是否应该拦截
-    if not M.should_intercept(ifname) then
+    local should_handle, real_ifname = M.should_intercept(ifname)
+    if not should_handle then
         c_log(string.format("[net] %s for %s - not intercepting", cmd_name, ifname))
         return false, 0
     end
+
+    -- 使用真实接口名（eth0）的配置
+    c_log(string.format("[net] %s for %s (using %s config)", cmd_name, ifname, real_ifname))
 
     -- ifreq 偏移量
     local IFNAMSIZ = 16  -- 接口名称长度

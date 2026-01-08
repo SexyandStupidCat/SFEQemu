@@ -130,6 +130,7 @@
 #include <lua.h>
 #include <lualib.h>
 #include <lauxlib.h>
+#include "exec/shadowstack.h"
 #include "linux_loop.h"
 #include "uname.h"
 
@@ -14705,6 +14706,26 @@ static int lua_write_guest_bytes(lua_State *L)
     return 2;
 }
 
+static int lua_get_shadowstack(lua_State *L)
+{
+    uint64_t *ret_addrs = NULL;
+    size_t n = 0;
+
+    if (!shadowstack_is_enabled() || !thread_cpu) {
+        lua_newtable(L);
+        return 1;
+    }
+
+    ret_addrs = shadowstack_copy_ret_addrs((uint32_t)thread_cpu->cpu_index, &n);
+    lua_createtable(L, (int)n, 0);
+    for (size_t i = 0; i < n; i++) {
+        lua_pushinteger(L, (lua_Integer)ret_addrs[i]);
+        lua_rawseti(L, -2, (lua_Integer)i + 1);
+    }
+    g_free(ret_addrs);
+    return 1;
+}
+
 /*
  * Initialize Lua syscall integration
  * Called once during rules_init() to register C functions
@@ -14734,6 +14755,9 @@ void init_lua_syscall_functions(lua_State *L)
         lua_register(L, "c_write_guest_bytes", lua_write_guest_bytes);
         lua_register(L, "c_read_bytes", lua_read_guest_bytes);
         lua_register(L, "c_write_bytes", lua_write_guest_bytes);
+
+        /* Shadow call stack (requires -shadowstack on) */
+        lua_register(L, "c_get_shadowstack", lua_get_shadowstack);
     }
 }
 

@@ -53,6 +53,7 @@
 #include "qemu/timer.h"
 #include "qemu/envlist.h"
 #include "qemu/guest-random.h"
+#include "exec/shadowstack.h"
 #include "elf.h"
 #include "trace/control.h"
 #include "user/cpu_loop.h"
@@ -478,6 +479,13 @@ static void handle_arg_jitdump(const char *arg)
     perf_enable_jitdump();
 }
 
+static void handle_arg_shadowstack(const char *arg)
+{
+    if (shadowstack_init_from_opts(TARGET_NAME, arg) < 0) {
+        usage(EXIT_FAILURE);
+    }
+}
+
 static QemuPluginList plugins = QTAILQ_HEAD_INITIALIZER(plugins);
 
 #ifdef CONFIG_PLUGIN
@@ -544,6 +552,8 @@ static const struct qemu_argument arg_table[] = {
      "path",       "set the rules folder path"},
     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
      "",           "[[enable=]<pattern>][,events=<file>][,file=<file>]"},
+    {"shadowstack", "QEMU_SHADOWSTACK", true, handle_arg_shadowstack,
+     "optstr",      "启用 shadowstack（on/off 或逗号分隔: log=on,summary=on,unwind_limit=N,max_stack=N；支持 x86_64/aarch64/arm/mips）"},
 #ifdef CONFIG_PLUGIN
     {"plugin",     "QEMU_PLUGIN",      true,  handle_arg_plugin,
      "",           "[file=]<file>[,<argname>=<argvalue>]"},

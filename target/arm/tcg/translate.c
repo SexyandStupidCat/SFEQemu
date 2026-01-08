@@ -5340,10 +5340,22 @@ static bool trans_B_cond_thumb(DisasContext *s, arg_ci *a)
     return true;
 }
 
+// static bool save_pc(target_ulong pc_addr) {
+//     int fd = open("/tmp/pc_trace.txt", O_WRONLY | O_CREAT | O_APPEND, 0644);
+//     if (fd < 0) {
+//         return false;
+//     }
+//     dprintf(fd, "PC: %llx\n", (long long)pc_addr);
+//     close(fd);
+//     return true;
+// }
+
 static bool trans_BL(DisasContext *s, arg_i *a)
 {
+    gen_helper_hook_bl(tcg_env, tcg_constant_i32(s->pc_curr));
     gen_pc_plus_diff(s, cpu_R[14], curr_insn_len(s) | s->thumb);
     gen_jmp(s, jmp_diff(s, a->imm));
+    // save_pc(s->pc_curr);
     return true;
 }
 

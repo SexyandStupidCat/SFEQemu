@@ -25,6 +25,7 @@ system_ss.add_all(tcg_ss)
 user_ss.add(files(
   'user-exec.c',
   'user-exec-stub.c',
+  'shadowstack.c',
 ))
 
 system_ss.add(files(

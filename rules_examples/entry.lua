@@ -77,6 +77,19 @@ local CFG = {
     probe_grace_syscalls = 64,
 }
 
+-- syscall_name 可能为 nil（C 侧映射表不全）。这里补充一小段“按 syscall 号反查名称”，
+-- 以便为网络相关 syscall（sendmsg/recvmsg 等）加载对应 Lua 规则。
+--
+-- 说明：这些号以 ARM EABI 为准（与本项目已有日志一致：socket=281, connect=283, openat=322）。
+local SYSCALL_NUM_TO_NAME = {
+    [289] = "send",
+    [290] = "sendto",
+    [291] = "recv",
+    [292] = "recvfrom",
+    [296] = "sendmsg",
+    [297] = "recvmsg",
+}
+
 local data_dir = rules_dir .. "data/"
 local state = {
     seq = 0,
@@ -144,8 +157,29 @@ local function load_handler_env(syscall_name)
         return nil
     end
 
-    local path = rules_dir .. "syscall/" .. syscall_name .. ".lua"
-    if not file_exists(path) then
+    -- 规则加载优先级：
+    -- 1) syscall_override/<name>.lua（AI/临时修复，不覆盖原规则）
+    -- 2) syscall/<name>.lua（基础规则）
+    local function resolve_rule_path(name)
+        local od = rawget(_G, "SFEMU_RULES_OVERRIDE_DIR")
+        if type(od) ~= "string" or od == "" then
+            od = "syscall_override"
+        end
+        od = tostring(od):gsub("/+$", "")
+
+        local p1 = rules_dir .. od .. "/" .. name .. ".lua"
+        if file_exists(p1) then
+            return p1
+        end
+        local p2 = rules_dir .. "syscall/" .. name .. ".lua"
+        if file_exists(p2) then
+            return p2
+        end
+        return nil
+    end
+
+    local path = resolve_rule_path(syscall_name)
+    if not path then
         missing_cache[syscall_name] = true
         return nil
     end
@@ -508,7 +542,15 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
     _G._sfemu_syscall_ctx = nil
 
     if type(syscall_name) ~= "string" or syscall_name == "" then
-        return false, 0
+        local mapped = nil
+        if type(num) == "number" then
+            mapped = SYSCALL_NUM_TO_NAME[num]
+        end
+        if type(mapped) == "string" and mapped ~= "" then
+            syscall_name = mapped
+        else
+            return false, 0
+        end
     end
 
     save_content(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)

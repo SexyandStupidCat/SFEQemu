@@ -870,23 +870,52 @@ function M.handle(ctx, entry_state, meta)
     end
 
     local function list_lua_files(dir)
-        local out = {}
+        local function popen_lines(cmd)
+            local p = io.popen(cmd, "r")
+            if not p then
+                return nil
+            end
+            local out = {}
+            for line in p:lines() do
+                if line and line ~= "" then
+                    out[#out + 1] = line
+                end
+            end
+            p:close()
+            table.sort(out)
+            return out
+        end
+
         if type(dir) ~= "string" or dir == "" then
-            return out
+            return {}
         end
-        local cmd = "find " .. sh_quote(dir) .. " -maxdepth 1 -type f -name \"*.lua\" 2>/dev/null"
-        local p = io.popen(cmd, "r")
-        if not p then
-            return out
-        end
-        for line in p:lines() do
-            if line and line ~= "" then
-                out[#out + 1] = line
+
+        -- 重要：QEMU 常在 chroot(rootfs) 内运行，此时 /usr/bin/find 可能是 guest(ARM) 的二进制，
+        -- host 无法直接执行，导致“目录列举为空”，进而无法应用 rules_patch。
+        -- 因为我们已经为 AI MCP 注入了 host 侧 python3（x86_64），这里优先用 python3 做 glob 列举。
+        do
+            local py = rawget(_G, "SFEMU_AI_MCP_PY")
+            if type(py) ~= "string" or py == "" then
+                py = "python3"
+            end
+            local code = "import glob,os,sys; d=sys.argv[1]; print('\\n'.join(sorted(glob.glob(os.path.join(d, '*.lua')))))"
+            local cmd = tostring(py) .. " -c " .. sh_quote(code) .. " " .. sh_quote(dir) .. " 2>/dev/null"
+            local out = popen_lines(cmd)
+            if out and #out > 0 then
+                return out
             end
         end
-        p:close()
-        table.sort(out)
-        return out
+
+        -- 兜底：非 chroot 场景下通常有 host 侧 find 可用
+        do
+            local cmd = "find " .. sh_quote(dir) .. " -maxdepth 1 -type f -name \"*.lua\" 2>/dev/null"
+            local out = popen_lines(cmd)
+            if out then
+                return out
+            end
+        end
+
+        return {}
     end
 
     local generated = {}
@@ -946,7 +975,7 @@ function M.handle(ctx, entry_state, meta)
     patch_readme[#patch_readme + 1] = "- 说明：外部工具可读取 env_path 获取 OPENAI_* 等配置，并输出 fix/syscall 规则。"
     patch_readme[#patch_readme + 1] = ""
     patch_readme[#patch_readme + 1] = "## 应用方式（默认不自动覆盖现有规则）"
-    patch_readme[#patch_readme + 1] = string.format("1) 将 fix/syscall 下的规则拷贝到 `%s/syscall/`", rules_dir:gsub("/$", ""))
+    patch_readme[#patch_readme + 1] = string.format("1) 将 fix/syscall 下的规则拷贝到 `%s/syscall_override/`（优先级高于 syscall/）", rules_dir:gsub("/$", ""))
     patch_readme[#patch_readme + 1] = "2) observe 规则仅用于定位问题，正式使用通常不需要"
     patch_readme[#patch_readme + 1] = ""
     write_file(patch_dir .. "/README.md", table.concat(patch_readme, "\n") .. "\n")
@@ -957,8 +986,13 @@ function M.handle(ctx, entry_state, meta)
     local backup_dir = run_dir .. "/backup_syscall"
 
     if cfg.apply_rules then
-        if cfg.overwrite_rules then
+        local backup_ready = false
+        local function ensure_backup_dir()
+            if backup_ready then
+                return
+            end
             mkdir_p(backup_dir, 493)
+            backup_ready = true
         end
 
         local backed_up = {}
@@ -984,23 +1018,33 @@ function M.handle(ctx, entry_state, meta)
                 end
             end
 
-            local dst = string.format("%ssyscall/%s.lua", rules_dir, tostring(g.syscall))
+            local base_dst = string.format("%ssyscall/%s.lua", rules_dir, tostring(g.syscall))
+            local override_dst = string.format("%ssyscall_override/%s.lua", rules_dir, tostring(g.syscall))
+
+            -- 默认不覆盖：所有修复规则统一落到 syscall_override/（由 entry.lua 优先加载），避免污染/覆盖基础规则
+            local dst = base_dst
+            local used_override = false
+            if not cfg.overwrite_rules then
+                mkdir_p(rules_dir .. "syscall_override", 493)
+                dst = override_dst
+                used_override = true
+            end
+
+            -- 备份：覆盖（或更新 override）前备份一次，便于回滚
             local existed = false
-            local df = io.open(dst, "rb")
-            if df then
-                existed = true
-                df:close()
+            do
+                local df = io.open(dst, "rb")
+                if df then
+                    existed = true
+                    df:close()
+                end
             end
-
-            if existed and not cfg.overwrite_rules then
-                append_file(retry_log_path, string.format("skip apply (exists): %s kind=%s\n", tostring(g.syscall), tostring(g.kind)))
-                return
-            end
-
-            if existed and cfg.overwrite_rules and not backed_up[tostring(g.syscall)] then
-                local bak = string.format("%s/%s.lua", backup_dir, tostring(g.syscall))
+            if existed and not backed_up[tostring(g.syscall) .. (used_override and ":override" or ":base")] then
+                ensure_backup_dir()
+                local suffix = used_override and "__override" or ""
+                local bak = string.format("%s/%s%s.lua", backup_dir, tostring(g.syscall), suffix)
                 copy_file(dst, bak)
-                backed_up[tostring(g.syscall)] = true
+                backed_up[tostring(g.syscall) .. (used_override and ":override" or ":base")] = true
                 append_file(retry_log_path, string.format("backup: %s -> %s\n", dst, bak))
             end
 
@@ -1010,7 +1054,8 @@ function M.handle(ctx, entry_state, meta)
                 if g.kind == "fix" then
                     applied_fix[#applied_fix + 1] = g.syscall
                 end
-                append_file(retry_log_path, string.format("applied: %s kind=%s\n", tostring(g.syscall), tostring(g.kind)))
+                append_file(retry_log_path, string.format("applied: %s kind=%s dst=%s\n",
+                    tostring(g.syscall), tostring(g.kind), used_override and "syscall_override" or "syscall"))
             else
                 append_file(retry_log_path, string.format("apply failed: %s kind=%s\n", tostring(g.syscall), tostring(g.kind)))
             end
@@ -1098,12 +1143,30 @@ local function export_stable_rules(v)
         return nil
     end
     local out_dir = string.format("%s/%s", tostring(v.stable_root or ""), tostring(v.run_id or "run"))
-    local out_syscall = out_dir .. "/syscall"
+    local out_syscall = out_dir .. "/syscall_override"
 
     mkdir_p(out_syscall, 493)
 
     local applied_fix_set = list_to_set(v.applied_fix_syscalls)
     local exported = {}
+
+    local function is_transient_rule(path)
+        local f = io.open(tostring(path), "rb")
+        if not f then
+            return false
+        end
+        local head = f:read(1024) or ""
+        f:close()
+        -- 约定：规则文件头部包含 `sfemu:transient=1` 时，不导出到 stable_rules（仅用于本轮重试）
+        if tostring(head):find("sfemu:transient=1", 1, true) then
+            return true
+        end
+        if tostring(head):find("sfemu_transient=1", 1, true) then
+            return true
+        end
+        return false
+    end
+
     for _, g in ipairs(v.generated or {}) do
         local is_fix = (g.kind == "fix")
         local should_export = false
@@ -1118,11 +1181,18 @@ local function export_stable_rules(v)
             should_export = true
         end
 
-        if should_export then
+        -- 默认不导出 exit/exit_group：这类规则通常仅用于“本轮重试/防退出”，正式使用不应依赖它
+        local is_exit = (tostring(g.syscall) == "exit") or (tostring(g.syscall) == "exit_group")
+        if should_export and not is_exit then
+            if is_transient_rule(g.file) then
+                -- 临时规则不导出（例如 exit_group 抑制一次）
+                goto continue_export
+            end
             local dst = string.format("%s/%s.lua", out_syscall, tostring(g.syscall))
             copy_file(g.file, dst)
             exported[#exported + 1] = { syscall = g.syscall, kind = g.kind, file = dst }
         end
+        ::continue_export::
     end
 
     local readme = {}
@@ -1132,11 +1202,11 @@ local function export_stable_rules(v)
     readme[#readme + 1] = string.format("- reason: `%s`", tostring(v.reason))
     readme[#readme + 1] = ""
     readme[#readme + 1] = "## 使用方式（正式使用）"
-    readme[#readme + 1] = string.format("将本目录下的 `syscall/*.lua` 拷贝到你的规则目录 `%s/syscall/`，只保留这些规则即可复现本次修复。", tostring(v.rules_dir):gsub("/$", ""))
+    readme[#readme + 1] = string.format("将本目录下的 `syscall_override/*.lua` 拷贝到你的规则目录 `%s/syscall_override/`（不覆盖原有 syscall/），即可复现本次修复。", tostring(v.rules_dir):gsub("/$", ""))
     readme[#readme + 1] = ""
     readme[#readme + 1] = "## 导出内容"
     for _, e in ipairs(exported) do
-        readme[#readme + 1] = string.format("- syscall/%s.lua (%s)", tostring(e.syscall), tostring(e.kind))
+        readme[#readme + 1] = string.format("- syscall_override/%s.lua (%s)", tostring(e.syscall), tostring(e.kind))
     end
     readme[#readme + 1] = ""
     write_file(out_dir .. "/README.md", table.concat(readme, "\n") .. "\n")
@@ -1197,7 +1267,7 @@ function M.on_syscall(ctx, entry_state)
         log("验证通过：固件已稳定运行，稳定规则已导出：%s", tostring(out.dir))
         if type(out.exported) == "table" then
             for _, e in ipairs(out.exported) do
-                log("stable: syscall/%s.lua (%s)", tostring(e.syscall), tostring(e.kind))
+                log("stable: syscall_override/%s.lua (%s)", tostring(e.syscall), tostring(e.kind))
             end
         end
     end

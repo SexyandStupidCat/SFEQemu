@@ -15308,6 +15308,18 @@ static void *sfemu_idle_watchdog_thread(void *opaque)
 {
     (void)opaque;
 
+    /*
+     * 重要：该 watchdog 线程不隶属于任何 CPUState/TaskState。
+     * 如果它接收到进程级信号（例如 SIGCHLD），会进入 linux-user/signal.c
+     * 的 host_signal_handler()，而该 handler 依赖于当前线程绑定的 CPU，
+     * 进而在 cpu==NULL 时崩溃。
+     *
+     * QEMU 其他后台线程通常会屏蔽信号；这里也做同样处理，避免信号被投递到本线程。
+     */
+    sigset_t set;
+    sigfillset(&set);
+    pthread_sigmask(SIG_BLOCK, &set, NULL);
+
     for (;;) {
         uint64_t interval_ns = sfemu_idle_interval_ns;
         if (interval_ns == 0) {

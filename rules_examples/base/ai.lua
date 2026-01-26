@@ -1120,8 +1120,10 @@ function M.handle(ctx, entry_state, meta)
         applied_syscalls = applied,
         applied_fix_syscalls = applied_fix,
         stable_root = stable_root,
-        -- 只有在真正应用了修复规则后才自动继续（避免“无修复仍继续”导致反复触发）
-        auto_continue = (cfg.auto_continue == true and #applied_fix > 0),
+        -- 自动继续：
+        -- - SFEMU_AI_AUTO_CONTINUE=1：无论本轮是否产出修复，都继续运行（避免无人值守时卡在提示）
+        -- - SFEMU_AI_AUTO_CONTINUE=0：保持暂停，等待人工确认（entry.lua 会提示输入 YES）
+        auto_continue = (cfg.auto_continue == true),
     }
 end
 

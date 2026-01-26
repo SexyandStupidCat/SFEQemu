@@ -96,6 +96,7 @@ local state = {
     keys = {},
     ctxs = {},
     files = {},
+    idle_seq = 0,
     ai = {
         runs = 0,
         last_run_seq = 0,
@@ -480,7 +481,13 @@ local function ai_handle(ctx, meta)
     state.ai.runs = (state.ai.runs or 0) + 1
     state.ai.last_run_seq = ctx.seq
 
+    if type(c_watchdog_suspend) == "function" then
+        pcall(c_watchdog_suspend, true)
+    end
     local ok, res = pcall(ai.handle, ctx, state, meta)
+    if type(c_watchdog_suspend) == "function" then
+        pcall(c_watchdog_suspend, false)
+    end
     if not ok then
         log("AI 干预失败：%s", tostring(res))
         return { auto_continue = false }
@@ -535,6 +542,55 @@ local function save_content(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg
 
     _G._sfemu_syscall_ctx = ctx
     push_recent(ctx)
+end
+
+-- idle(pc, idle_ms, pc_seq_len, pc_repeats)
+-- 由 C 侧 idle watchdog 触发：当长时间没有 syscall 时，采样 PC 序列检测到重复模式，
+-- 认为“疑似用户态死循环”，进入与 deadloop 类似的 AI/人工干预路径。
+function idle(pc, idle_ms, pc_seq_len, pc_repeats)
+    state.idle_seq = (state.idle_seq or 0) + 1
+
+    local sec, nsec = nil, nil
+    if type(c_get_timestamp) == "function" then
+        sec, nsec = c_get_timestamp()
+    end
+
+    local ctx = {
+        -- 避免与 syscall seq 冲突：基于 syscall seq 叠加一个 idle 子序号
+        seq = (tonumber(state.seq) or 0) * 100000 + (tonumber(state.idle_seq) or 0),
+        name = "idle",
+        num = -1,
+        args = { pc, idle_ms, pc_seq_len, pc_repeats },
+        ts_sec = sec,
+        ts_nsec = nsec,
+        backtrace = get_backtrace(),
+        hooked = true,
+    }
+
+    log("长时间无 syscall：pc=0x%x idle_ms=%s pc_seq_len=%s repeats=%s",
+        tonumber(pc) or 0,
+        tostring(idle_ms),
+        tostring(pc_seq_len),
+        tostring(pc_repeats))
+
+    pause_and_wait_handle(ctx)
+
+    local res = nil
+    local ai_on = need_ai(ctx)
+    log("idle deadloop 触发：need_ai=%s", tostring(ai_on))
+    if ai_on then
+        res = ai_handle(ctx, {
+            reason = "idle_deadloop",
+            pc = pc,
+            idle_ms = idle_ms,
+            pc_seq_len = pc_seq_len,
+            pc_repeats = pc_repeats,
+        })
+    end
+
+    if not (type(res) == "table" and res.auto_continue == true) then
+        manual_handle(ctx)
+    end
 end
 
 function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)

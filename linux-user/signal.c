@@ -1413,6 +1413,13 @@ void process_pending_signals(CPUArchState *cpu_env)
         sigprocmask(SIG_SETMASK, &set, 0);
     }
     ts->in_sigsuspend = 0;
+
+    /*
+     * SFEmu: rules idle watchdog（长时间无系统调用时，采样 PC 判断是否陷入死循环，
+     * 并走 Lua/AI 干预链路）。为了避免侵入每个 target 的 cpu_loop，这里统一在
+     * process_pending_signals() 尾部（已恢复 host signal mask）做一次 poll。
+     */
+    sfemu_idle_watchdog_poll(cpu_env);
 }
 
 int process_sigsuspend_mask(sigset_t **pset, target_ulong sigset,

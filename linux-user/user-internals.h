@@ -64,6 +64,10 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
                     abi_long arg2, abi_long arg3, abi_long arg4,
                     abi_long arg5, abi_long arg6, abi_long arg7,
                     abi_long arg8);
+
+/* SFEmu: rules idle watchdog（长时间无系统调用/前进性检测） */
+void sfemu_idle_watchdog_start(CPUState *cpu, unsigned long idle_ms);
+void sfemu_idle_watchdog_poll(CPUArchState *cpu_env);
 extern __thread CPUState *thread_cpu;
 abi_long get_errno(abi_long ret);
 const char *target_strerror(int err);

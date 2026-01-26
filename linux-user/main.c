@@ -88,6 +88,7 @@ static const char *cpu_type;
 static const char *seed_optarg;
 const char *rules_path = NULL;  /* Exported for syscall.c */
 static unsigned long rules_ctx_keep = 256;
+static unsigned long rules_idle_ms = 5000;
 static const char *sfanalysis_out_dir;
 unsigned long mmap_min_addr;
 uintptr_t guest_base;
@@ -377,6 +378,15 @@ static void handle_arg_rules_ctx_keep(const char *arg)
     rules_ctx_keep = val;
 }
 
+static void handle_arg_rules_idle_ms(const char *arg)
+{
+    unsigned long val;
+    if (qemu_strtoul(arg, NULL, 0, &val)) {
+        usage(EXIT_FAILURE);
+    }
+    rules_idle_ms = val;
+}
+
 static void handle_arg_sfanalysis(const char *arg)
 {
     sfanalysis_out_dir = strdup(arg);
@@ -569,6 +579,8 @@ static const struct qemu_argument arg_table[] = {
      "path",       "set the rules folder path"},
     {"rules-ctx-keep", "QEMU_RULES_CTX_KEEP", true, handle_arg_rules_ctx_keep,
      "n",          "syscall 上下文写入 rules/data 的保留数量（0=不落盘）"},
+    {"rules-idle-ms", "QEMU_RULES_IDLE_MS", true, handle_arg_rules_idle_ms,
+     "ms",         "长时间无系统调用时的前进性/死循环检查阈值（0=禁用）"},
     {"sfanalysis", "QEMU_SFANALYSIS",  true,  handle_arg_sfanalysis,
      "path",       "设置 SFAnalysis 输出目录（用于地址->函数名/伪C 解析）"},
     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
@@ -876,6 +888,8 @@ static void rules_init(const char *path) {
     lua_setglobal(rules_lua_state, "SFEMU_RULES_PATH");
     lua_pushinteger(rules_lua_state, (lua_Integer)rules_ctx_keep);
     lua_setglobal(rules_lua_state, "SFEMU_SYSCALL_CTX_KEEP");
+    lua_pushinteger(rules_lua_state, (lua_Integer)rules_idle_ms);
+    lua_setglobal(rules_lua_state, "SFEMU_RULES_IDLE_MS");
 
     /* Register C helper functions for Lua */
     lua_register(rules_lua_state, "c_log", lua_log_message);
@@ -1051,6 +1065,7 @@ int main(int argc, char **argv, char **envp)
     env = cpu_env(cpu);
     cpu_reset(cpu);
     thread_cpu = cpu;
+    sfemu_idle_watchdog_start(cpu, rules_idle_ms);
 
     /*
      * Reserving too much vm space via mmap can run into problems with rlimits,

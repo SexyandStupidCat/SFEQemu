@@ -161,6 +161,36 @@ extern const char *rules_path;
 /* Global variable to store current CPU environment for Lua callbacks */
 static __thread CPUArchState *current_cpu_env = NULL;
 
+/*
+ * SFEmu: 长时间无系统调用时的“前进性/死循环”检测
+ *
+ * 背景：
+ * - 现有 Lua 规则链路主要在 syscall 入口/出口触发；
+ * - 当目标进程长时间不触发 syscall（例如陷入 userspace 自旋/死循环），Lua 侧无法获知；
+ * - 因此增加一个轻量 watchdog：后台定时 kick CPU 让 cpu_exec 返回，
+ *   在安全点采样 PC 序列，若检测到重复模式则回调 Lua idle()，走既有 AI/人工干预路径。
+ *
+ * 设计要点：
+ * - 默认阈值通过 --rules-idle-ms / QEMU_RULES_IDLE_MS 控制（0=禁用）；
+ * - watchdog 仅在 rules 启用时启动；
+ * - 为避免用户在暂停/AI 调用期间被 watchdog 再次打断，提供 c_watchdog_suspend()。
+ */
+static bool ensure_lua_entry_loaded(void);
+
+static uint64_t sfemu_idle_timeout_ns;
+static uint64_t sfemu_idle_interval_ns;
+static CPUState *sfemu_idle_cpu;
+static pthread_t sfemu_idle_tid;
+static bool sfemu_idle_started;
+static int sfemu_idle_kick_pending;
+static int sfemu_idle_suspended;
+static uint64_t sfemu_idle_last_trigger_ns;
+static uint64_t sfemu_last_activity_ns;
+
+#define SFEMU_IDLE_PC_BUF 128
+static abi_ulong sfemu_idle_pcs[SFEMU_IDLE_PC_BUF];
+static int sfemu_idle_pc_count;
+
 /* Forward declaration of do_syscall1 for Lua integration */
 abi_long do_syscall1(CPUArchState *cpu_env, int num, abi_long arg1,
                      abi_long arg2, abi_long arg3, abi_long arg4,
@@ -15107,6 +15137,10 @@ static int lua_wait_user_continue(lua_State *L)
     FILE *in = tty ? tty : stdin;
     FILE *out = tty ? tty : stderr;
     char buf[128];
+    int old_suspend = qatomic_read(&sfemu_idle_suspended);
+
+    /* 避免在人工暂停期间 watchdog 继续 kick 导致恢复后立即被打断 */
+    qatomic_set(&sfemu_idle_suspended, 1);
 
     for (;;) {
         fprintf(out, "%s", prompt);
@@ -15116,6 +15150,7 @@ static int lua_wait_user_continue(lua_State *L)
             if (tty) {
                 fclose(tty);
             }
+            qatomic_set(&sfemu_idle_suspended, old_suspend);
             lua_pushboolean(L, false);
             lua_pushinteger(L, -TARGET_EIO);
             return 2;
@@ -15141,9 +15176,296 @@ static int lua_wait_user_continue(lua_State *L)
         fclose(tty);
     }
 
+    qatomic_set(&sfemu_idle_suspended, old_suspend);
     lua_pushboolean(L, true);
     lua_pushinteger(L, 0);
     return 2;
+}
+
+/*
+ * Lua C 函数：暂停/恢复 idle watchdog（用于 AI 调用/人工干预期间避免被打断）
+ * 用法：ok, rc = c_watchdog_suspend(true/false)
+ */
+static int lua_watchdog_suspend(lua_State *L)
+{
+    int on = lua_toboolean(L, 1) ? 1 : 0;
+    qatomic_set(&sfemu_idle_suspended, on);
+    lua_pushboolean(L, true);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+static uint64_t sfemu_now_ns(void)
+{
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) {
+        return 0;
+    }
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+static void sfemu_idle_touch_at(uint64_t now_ns)
+{
+    if (now_ns == 0) {
+        now_ns = sfemu_now_ns();
+    }
+    qatomic_set(&sfemu_last_activity_ns, now_ns);
+    sfemu_idle_pc_count = 0;
+}
+
+static int sfemu_pc_unique_count(const abi_ulong *pcs, int n)
+{
+    int uniq = 0;
+    for (int i = 0; i < n; i++) {
+        bool seen = false;
+        for (int j = 0; j < i; j++) {
+            if (pcs[j] == pcs[i]) {
+                seen = true;
+                break;
+            }
+        }
+        if (!seen) {
+            uniq++;
+        }
+    }
+    return uniq;
+}
+
+static bool sfemu_detect_repeating_pc_sequence(const abi_ulong *pcs, int n,
+                                               int max_seq_len, int min_repeats,
+                                               int *out_seq_len, int *out_repeats)
+{
+    if (n <= 0 || max_seq_len <= 0 || min_repeats <= 1) {
+        return false;
+    }
+
+    for (int seq_len = 1; seq_len <= max_seq_len; seq_len++) {
+        int total = seq_len * min_repeats;
+        if (n < total) {
+            break;
+        }
+
+        bool ok = true;
+        int base0 = n - seq_len; /* 最后一段起点（0-based） */
+        for (int rep = 1; rep <= min_repeats - 1; rep++) {
+            int other = n - (rep + 1) * seq_len;
+            for (int i = 0; i < seq_len; i++) {
+                if (pcs[base0 + i] != pcs[other + i]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (!ok) {
+                break;
+            }
+        }
+
+        if (ok) {
+            if (out_seq_len) {
+                *out_seq_len = seq_len;
+            }
+            if (out_repeats) {
+                *out_repeats = min_repeats;
+            }
+            return true;
+        }
+    }
+    return false;
+}
+
+static void execute_lua_idle_hook(CPUArchState *cpu_env, abi_ulong pc,
+                                  uint64_t idle_ms, int seq_len, int repeats)
+{
+    lua_State *L = rules_lua_state;
+
+    if (!ensure_lua_entry_loaded()) {
+        return;
+    }
+
+    current_cpu_env = cpu_env;
+
+    lua_getglobal(L, "idle");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        current_cpu_env = NULL;
+        return;
+    }
+
+    lua_pushinteger(L, (lua_Integer)pc);
+    lua_pushinteger(L, (lua_Integer)idle_ms);
+    lua_pushinteger(L, (lua_Integer)seq_len);
+    lua_pushinteger(L, (lua_Integer)repeats);
+
+    if (lua_pcall(L, 4, 0, 0) != LUA_OK) {
+        fprintf(stderr, "Error calling idle() hook: %s\n", lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    current_cpu_env = NULL;
+}
+
+static void *sfemu_idle_watchdog_thread(void *opaque)
+{
+    (void)opaque;
+
+    for (;;) {
+        uint64_t interval_ns = sfemu_idle_interval_ns;
+        if (interval_ns == 0) {
+            interval_ns = 200ULL * 1000000ULL;
+        }
+
+        struct timespec req = {
+            .tv_sec = (time_t)(interval_ns / 1000000000ULL),
+            .tv_nsec = (long)(interval_ns % 1000000000ULL),
+        };
+        while (nanosleep(&req, &req) != 0 && errno == EINTR) {
+            /* retry */
+        }
+
+        if (!sfemu_idle_started || !sfemu_idle_cpu) {
+            continue;
+        }
+        if (qatomic_read(&sfemu_idle_suspended) != 0) {
+            continue;
+        }
+
+        uint64_t timeout_ns = sfemu_idle_timeout_ns;
+        if (timeout_ns == 0) {
+            continue;
+        }
+
+        uint64_t now = sfemu_now_ns();
+        uint64_t last = qatomic_read(&sfemu_last_activity_ns);
+        if (last == 0 || now == 0) {
+            continue;
+        }
+        if (now - last < timeout_ns) {
+            continue;
+        }
+
+        /* 触发一次“安全点返回”，让 cpu_loop 进入 process_pending_signals() */
+        qatomic_set(&sfemu_idle_kick_pending, 1);
+        cpu_exit(sfemu_idle_cpu);
+    }
+    return NULL;
+}
+
+void sfemu_idle_watchdog_start(CPUState *cpu, unsigned long idle_ms)
+{
+    if (!cpu) {
+        return;
+    }
+    if (!rules_lua_state || !rules_path) {
+        return;
+    }
+    if (sfemu_idle_started) {
+        return;
+    }
+    if (idle_ms == 0) {
+        return;
+    }
+
+    sfemu_idle_cpu = cpu;
+    sfemu_idle_timeout_ns = (uint64_t)idle_ms * 1000000ULL;
+
+    /* 采样间隔默认取 idle_ms 的 1/10，并做简单夹逼 */
+    unsigned long interval_ms = idle_ms / 10;
+    if (interval_ms < 50) {
+        interval_ms = 50;
+    }
+    if (interval_ms > 500) {
+        interval_ms = 500;
+    }
+    sfemu_idle_interval_ns = (uint64_t)interval_ms * 1000000ULL;
+
+    qatomic_set(&sfemu_idle_kick_pending, 0);
+    qatomic_set(&sfemu_idle_suspended, 0);
+    sfemu_idle_last_trigger_ns = 0;
+    sfemu_idle_pc_count = 0;
+    sfemu_idle_touch_at(sfemu_now_ns());
+
+    int prc = pthread_create(&sfemu_idle_tid, NULL, sfemu_idle_watchdog_thread, NULL);
+    if (prc != 0) {
+        fprintf(stderr, "Warning: SFEmu idle watchdog thread create failed: %s\n", strerror(prc));
+        return;
+    }
+    pthread_detach(sfemu_idle_tid);
+    sfemu_idle_started = true;
+
+    fprintf(stderr, "SFEmu idle watchdog enabled: idle_ms=%lu interval_ms=%lu\n",
+            idle_ms, interval_ms);
+    fflush(stderr);
+}
+
+void sfemu_idle_watchdog_poll(CPUArchState *cpu_env)
+{
+    if (!sfemu_idle_started || !cpu_env) {
+        return;
+    }
+    if (sfemu_idle_timeout_ns == 0) {
+        return;
+    }
+
+    /* 只在 watchdog 主动 kick 后才进行采样，避免影响正常路径 */
+    if (qatomic_xchg(&sfemu_idle_kick_pending, 0) == 0) {
+        return;
+    }
+    if (qatomic_read(&sfemu_idle_suspended) != 0) {
+        return;
+    }
+
+    uint64_t now = sfemu_now_ns();
+    uint64_t last = qatomic_read(&sfemu_last_activity_ns);
+    if (now == 0 || last == 0) {
+        return;
+    }
+    uint64_t idle_ns = now - last;
+    if (idle_ns < sfemu_idle_timeout_ns) {
+        return;
+    }
+
+    /* 冷却：避免连续触发导致干预刷屏 */
+    if (sfemu_idle_last_trigger_ns != 0 &&
+        (now - sfemu_idle_last_trigger_ns) < 1000000000ULL) {
+        return;
+    }
+
+    CPUState *cpu = env_cpu(cpu_env);
+    abi_ulong pc = cpu->cc->get_pc(cpu);
+
+    if (sfemu_idle_pc_count < SFEMU_IDLE_PC_BUF) {
+        sfemu_idle_pcs[sfemu_idle_pc_count++] = pc;
+    } else {
+        memmove(&sfemu_idle_pcs[0], &sfemu_idle_pcs[1],
+                sizeof(sfemu_idle_pcs[0]) * (SFEMU_IDLE_PC_BUF - 1));
+        sfemu_idle_pcs[SFEMU_IDLE_PC_BUF - 1] = pc;
+        sfemu_idle_pc_count = SFEMU_IDLE_PC_BUF;
+    }
+
+    int seq_len = 0;
+    int repeats = 0;
+    bool is_loop = sfemu_detect_repeating_pc_sequence(sfemu_idle_pcs, sfemu_idle_pc_count,
+                                                      16, 3, &seq_len, &repeats);
+    if (is_loop) {
+        sfemu_idle_last_trigger_ns = now;
+        sfemu_idle_pc_count = 0;
+        sfemu_idle_touch_at(now);
+        execute_lua_idle_hook(cpu_env, pc, idle_ns / 1000000ULL, seq_len, repeats);
+        return;
+    }
+
+    /*
+     * 若采样窗口内 PC 分布足够“发散”，认为仍在前进（即便未触发 syscall），
+     * 触发一次 activity touch，避免 watchdog 反复 kick 造成明显性能扰动。
+     */
+    if (sfemu_idle_pc_count >= 16) {
+        int start = sfemu_idle_pc_count - 16;
+        int uniq = sfemu_pc_unique_count(&sfemu_idle_pcs[start], 16);
+        if (uniq >= 12) {
+            sfemu_idle_pc_count = 0;
+            sfemu_idle_touch_at(now);
+        }
+    }
 }
 
 /*
@@ -15212,6 +15534,7 @@ void init_lua_syscall_functions(lua_State *L)
         /* Emulation control helpers */
         lua_register(L, "c_async_probe_http", lua_async_probe_http);
         lua_register(L, "c_wait_user_continue", lua_wait_user_continue);
+        lua_register(L, "c_watchdog_suspend", lua_watchdog_suspend);
         lua_register(L, "c_mkdir_p", lua_mkdir_p);
     }
 }
@@ -15599,6 +15922,11 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
 
     record_syscall_start(cpu, num, arg1,
                          arg2, arg3, arg4, arg5, arg6, arg7, arg8);
+
+    /* SFEmu: syscall 发生意味着有前进性，更新 idle watchdog 的 activity 时间戳 */
+    if (sfemu_idle_started) {
+        sfemu_idle_touch_at(sfemu_now_ns());
+    }
 
     if (unlikely(qemu_loglevel_mask(LOG_STRACE))) {
         print_syscall(cpu_env, num, arg1, arg2, arg3, arg4, arg5, arg6);

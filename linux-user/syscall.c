@@ -55,6 +55,7 @@
 #include <utime.h>
 #include <sys/sysinfo.h>
 #include <sys/signalfd.h>
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/tcp.h>
@@ -151,6 +152,7 @@
 #include "qapi/error.h"
 #include "fd-trans.h"
 #include "user/cpu_loop.h"
+#include "sfanalysis.h"
 
 /* External Lua state and rules path from main.c */
 extern lua_State *rules_lua_state;
@@ -14458,6 +14460,230 @@ static int lua_h2g(lua_State *L)
 }
 
 /*
+ * Lua C 函数：地址解析（基于 SFAnalysis 输出）
+ * 用法：info, rc = c_resolve_addr(guest_addr[, max_pseudocode_bytes])
+ */
+static int lua_resolve_addr(lua_State *L)
+{
+    abi_ulong guest_addr;
+    lua_Integer max_bytes_arg;
+    size_t max_bytes;
+    CPUState *cpu;
+    SfAnalysisResolved res;
+    int rc;
+
+    if (!current_cpu_env) {
+        lua_pushnil(L);
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
+    }
+
+    guest_addr = (abi_ulong)luaL_checkinteger(L, 1);
+    max_bytes_arg = luaL_optinteger(L, 2, 4096);
+    if (max_bytes_arg < 0 || max_bytes_arg > SSIZE_MAX) {
+        lua_pushnil(L);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    max_bytes = (size_t)max_bytes_arg;
+
+    cpu = env_cpu(current_cpu_env);
+    rc = sfanalysis_resolve_guest_addr(cpu, guest_addr, max_bytes, &res);
+    if (rc < 0) {
+        sfanalysis_resolved_cleanup(&res);
+        lua_pushnil(L);
+        lua_pushinteger(L, -host_to_target_errno(-rc));
+        return 2;
+    }
+
+    lua_newtable(L);
+
+    lua_pushinteger(L, (lua_Integer)res.guest_addr);
+    lua_setfield(L, -2, "addr");
+
+    if (res.map_path) {
+        lua_pushstring(L, res.map_path);
+        lua_setfield(L, -2, "map_path");
+    }
+    lua_pushinteger(L, (lua_Integer)res.map_start_guest);
+    lua_setfield(L, -2, "map_start");
+    lua_pushinteger(L, (lua_Integer)res.map_offset_file);
+    lua_setfield(L, -2, "map_offset");
+
+    lua_pushinteger(L, (lua_Integer)res.load_bias_guest);
+    lua_setfield(L, -2, "load_bias");
+    lua_pushinteger(L, (lua_Integer)res.analysis_addr);
+    lua_setfield(L, -2, "analysis_addr");
+
+    if (res.module_name) {
+        lua_pushstring(L, res.module_name);
+        lua_setfield(L, -2, "module_name");
+    }
+    if (res.module_real_path) {
+        lua_pushstring(L, res.module_real_path);
+        lua_setfield(L, -2, "module_real_path");
+    }
+
+    if (res.func_name) {
+        lua_pushstring(L, res.func_name);
+        lua_setfield(L, -2, "func_name");
+
+        if (res.func_prototype) {
+            lua_pushstring(L, res.func_prototype);
+            lua_setfield(L, -2, "prototype");
+        }
+        lua_pushinteger(L, (lua_Integer)res.func_entry);
+        lua_setfield(L, -2, "func_entry");
+        lua_pushinteger(L, (lua_Integer)res.func_size);
+        lua_setfield(L, -2, "func_size");
+        lua_pushinteger(L, (lua_Integer)res.func_offset);
+        lua_setfield(L, -2, "func_offset");
+
+        if (res.pseudocode_file) {
+            lua_pushstring(L, res.pseudocode_file);
+            lua_setfield(L, -2, "pseudocode_file");
+        }
+        if (res.pseudocode) {
+            lua_pushstring(L, res.pseudocode);
+            lua_setfield(L, -2, "pseudocode");
+            lua_pushboolean(L, res.pseudocode_truncated);
+            lua_setfield(L, -2, "pseudocode_truncated");
+        }
+    }
+
+    sfanalysis_resolved_cleanup(&res);
+
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+/*
+ * Lua C 函数：按 host 地址解析（基于 SFAnalysis 输出）
+ * 用法：
+ *   info, rc = c_resolve_host_addr(host_addr[, max_pseudocode_bytes])
+ *   info, rc = c_resolve_host_addr(host_ptr[, max_pseudocode_bytes])  -- host_ptr 为 lightuserdata
+ */
+static int lua_resolve_host_addr(lua_State *L)
+{
+    uint64_t host_addr;
+    lua_Integer max_bytes_arg;
+    size_t max_bytes;
+    SfAnalysisResolved res;
+    int rc;
+
+    if (!current_cpu_env) {
+        lua_pushnil(L);
+        lua_pushinteger(L, -TARGET_EPERM);
+        return 2;
+    }
+
+    if (lua_islightuserdata(L, 1)) {
+        void *p = lua_touserdata(L, 1);
+        if (!p) {
+            lua_pushnil(L);
+            lua_pushinteger(L, -TARGET_EINVAL);
+            return 2;
+        }
+        host_addr = (uint64_t)(uintptr_t)p;
+    } else {
+        lua_Integer v = luaL_checkinteger(L, 1);
+        if (v <= 0) {
+            lua_pushnil(L);
+            lua_pushinteger(L, -TARGET_EINVAL);
+            return 2;
+        }
+        host_addr = (uint64_t)v;
+    }
+
+    max_bytes_arg = luaL_optinteger(L, 2, 4096);
+    if (max_bytes_arg < 0 || max_bytes_arg > SSIZE_MAX) {
+        lua_pushnil(L);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    max_bytes = (size_t)max_bytes_arg;
+
+    rc = sfanalysis_resolve_host_addr(host_addr, max_bytes, &res);
+    if (rc < 0) {
+        sfanalysis_resolved_cleanup(&res);
+        lua_pushnil(L);
+        lua_pushinteger(L, -host_to_target_errno(-rc));
+        return 2;
+    }
+
+    lua_newtable(L);
+
+    lua_pushinteger(L, (lua_Integer)host_addr);
+    lua_setfield(L, -2, "addr");
+    lua_pushinteger(L, (lua_Integer)host_addr);
+    lua_setfield(L, -2, "host_addr");
+
+    if (res.guest_addr) {
+        lua_pushinteger(L, (lua_Integer)res.guest_addr);
+        lua_setfield(L, -2, "guest_addr");
+    }
+
+    if (res.map_path) {
+        lua_pushstring(L, res.map_path);
+        lua_setfield(L, -2, "map_path");
+    }
+
+    if (res.map_start_guest) {
+        lua_pushinteger(L, (lua_Integer)res.map_start_guest);
+        lua_setfield(L, -2, "map_start");
+    }
+    lua_pushinteger(L, (lua_Integer)res.map_offset_file);
+    lua_setfield(L, -2, "map_offset");
+
+    if (res.load_bias_guest) {
+        lua_pushinteger(L, (lua_Integer)res.load_bias_guest);
+        lua_setfield(L, -2, "load_bias");
+    }
+    lua_pushinteger(L, (lua_Integer)res.analysis_addr);
+    lua_setfield(L, -2, "analysis_addr");
+
+    if (res.module_name) {
+        lua_pushstring(L, res.module_name);
+        lua_setfield(L, -2, "module_name");
+    }
+    if (res.module_real_path) {
+        lua_pushstring(L, res.module_real_path);
+        lua_setfield(L, -2, "module_real_path");
+    }
+
+    if (res.func_name) {
+        lua_pushstring(L, res.func_name);
+        lua_setfield(L, -2, "func_name");
+
+        if (res.func_prototype) {
+            lua_pushstring(L, res.func_prototype);
+            lua_setfield(L, -2, "prototype");
+        }
+        lua_pushinteger(L, (lua_Integer)res.func_entry);
+        lua_setfield(L, -2, "func_entry");
+        lua_pushinteger(L, (lua_Integer)res.func_size);
+        lua_setfield(L, -2, "func_size");
+        lua_pushinteger(L, (lua_Integer)res.func_offset);
+        lua_setfield(L, -2, "func_offset");
+
+        if (res.pseudocode_file) {
+            lua_pushstring(L, res.pseudocode_file);
+            lua_setfield(L, -2, "pseudocode_file");
+        }
+        if (res.pseudocode) {
+            lua_pushstring(L, res.pseudocode);
+            lua_setfield(L, -2, "pseudocode");
+            lua_pushboolean(L, res.pseudocode_truncated);
+            lua_setfield(L, -2, "pseudocode_truncated");
+        }
+    }
+
+    sfanalysis_resolved_cleanup(&res);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+/*
  * Lua C function: read string from guest memory
  * Usage: str = c_read_guest_string(guest_addr, max_len)
  */
@@ -14726,6 +14952,228 @@ static int lua_get_shadowstack(lua_State *L)
     return 1;
 }
 
+typedef struct SfemuProbeHttpArgs {
+    char *host_ipv4;
+    int timeout_ms;
+    char *payload;
+} SfemuProbeHttpArgs;
+
+static int sfemu_probe_connect_send_ipv4(const char *host_ipv4, int port,
+                                         const char *payload, int timeout_ms)
+{
+    struct sockaddr_in addr;
+    int fd;
+    int rc;
+    int soerr = 0;
+    socklen_t slen = sizeof(soerr);
+    int flags;
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (!host_ipv4 || inet_pton(AF_INET, host_ipv4, &addr.sin_addr) != 1) {
+        return -EINVAL;
+    }
+
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return -errno;
+    }
+
+    flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) {
+        (void)fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    }
+
+    rc = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (rc < 0 && errno != EINPROGRESS) {
+        rc = -errno;
+        close(fd);
+        return rc;
+    }
+
+    struct pollfd pfd = {
+        .fd = fd,
+        .events = POLLOUT,
+    };
+    rc = poll(&pfd, 1, timeout_ms);
+    if (rc < 0) {
+        rc = -errno;
+        close(fd);
+        return rc;
+    }
+    if (rc == 0) {
+        close(fd);
+        return -ETIMEDOUT;
+    }
+
+    if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &slen) < 0) {
+        rc = -errno;
+        close(fd);
+        return rc;
+    }
+    if (soerr != 0) {
+        close(fd);
+        return -soerr;
+    }
+
+    if (payload && payload[0]) {
+        (void)send(fd, payload, strlen(payload), MSG_NOSIGNAL);
+    }
+
+    close(fd);
+    return 0;
+}
+
+static void *sfemu_probe_http_thread(void *opaque)
+{
+    SfemuProbeHttpArgs *args = opaque;
+
+    if (!args) {
+        return NULL;
+    }
+
+    (void)sfemu_probe_connect_send_ipv4(args->host_ipv4, 80, args->payload,
+                                        args->timeout_ms);
+    (void)sfemu_probe_connect_send_ipv4(args->host_ipv4, 443, args->payload,
+                                        args->timeout_ms);
+
+    g_free(args->host_ipv4);
+    g_free(args->payload);
+    g_free(args);
+    return NULL;
+}
+
+/*
+ * Lua C 函数：异步探测并触发目标服务交互（示例：HTTP/HTTPS 端口 80/443）
+ *
+ * 用法：started, rc = c_async_probe_http([host_ipv4[, timeout_ms[, payload]]])
+ * - host_ipv4: 默认 "127.0.0.1"
+ * - timeout_ms: 默认 500
+ * - payload: 默认 "GET / HTTP/1.0\\r\\n\\r\\n"
+ *
+ * 注意：该函数只负责在后台线程发起连接/发送，不保证一定能“打破死循环”；
+ *       是否恢复前进性由 Lua 侧基于 syscall 序列继续判定。
+ */
+static int lua_async_probe_http(lua_State *L)
+{
+    const char *host_ipv4;
+    lua_Integer timeout_ms_arg;
+    int timeout_ms;
+    const char *payload;
+    pthread_t tid;
+    int prc;
+    SfemuProbeHttpArgs *args;
+
+    host_ipv4 = luaL_optstring(L, 1, "127.0.0.1");
+    timeout_ms_arg = luaL_optinteger(L, 2, 500);
+    if (timeout_ms_arg < 0 || timeout_ms_arg > INT_MAX) {
+        lua_pushboolean(L, false);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    timeout_ms = (int)timeout_ms_arg;
+    payload = luaL_optstring(L, 3, "GET / HTTP/1.0\r\n\r\n");
+
+    args = g_new0(SfemuProbeHttpArgs, 1);
+    args->host_ipv4 = g_strdup(host_ipv4);
+    args->timeout_ms = timeout_ms;
+    args->payload = g_strdup(payload);
+
+    prc = pthread_create(&tid, NULL, sfemu_probe_http_thread, args);
+    if (prc != 0) {
+        g_free(args->host_ipv4);
+        g_free(args->payload);
+        g_free(args);
+        lua_pushboolean(L, false);
+        lua_pushinteger(L, -host_to_target_errno(prc));
+        return 2;
+    }
+    pthread_detach(tid);
+
+    lua_pushboolean(L, true);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+/*
+ * Lua C 函数：等待人工输入以继续运行（尽量使用 /dev/tty，避免占用 guest stdin）
+ * 用法：ok, rc = c_wait_user_continue([prompt])
+ */
+static int lua_wait_user_continue(lua_State *L)
+{
+    const char *prompt = luaL_optstring(L, 1, "检测到仿真异常，输入 YES 继续运行: ");
+    FILE *tty = fopen("/dev/tty", "r+");
+    FILE *in = tty ? tty : stdin;
+    FILE *out = tty ? tty : stderr;
+    char buf[128];
+
+    for (;;) {
+        fprintf(out, "%s", prompt);
+        fflush(out);
+
+        if (!fgets(buf, sizeof(buf), in)) {
+            if (tty) {
+                fclose(tty);
+            }
+            lua_pushboolean(L, false);
+            lua_pushinteger(L, -TARGET_EIO);
+            return 2;
+        }
+
+        /* 接受 YES/yes/y/Y/1 作为继续信号 */
+        char *p = buf;
+        while (*p && g_ascii_isspace(*p)) {
+            p++;
+        }
+        if (*p == 'y' || *p == 'Y' || *p == '1') {
+            break;
+        }
+        if (g_ascii_strncasecmp(p, "yes", 3) == 0) {
+            break;
+        }
+
+        fprintf(out, "请输入 YES/y 继续，或 Ctrl+C 终止。\n");
+        fflush(out);
+    }
+
+    if (tty) {
+        fclose(tty);
+    }
+
+    lua_pushboolean(L, true);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+/*
+ * Lua C 函数：创建目录（递归创建父目录）
+ * 用法：ok, rc = c_mkdir_p(path[, mode])
+ */
+static int lua_mkdir_p(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    lua_Integer mode_arg = luaL_optinteger(L, 2, 0755);
+    int mode;
+
+    if (mode_arg < 0 || mode_arg > 0777) {
+        lua_pushboolean(L, false);
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 2;
+    }
+    mode = (int)mode_arg;
+
+    if (g_mkdir_with_parents(path, mode) == 0) {
+        lua_pushboolean(L, true);
+        lua_pushinteger(L, 0);
+        return 2;
+    }
+
+    lua_pushboolean(L, false);
+    lua_pushinteger(L, -host_to_target_errno(errno));
+    return 2;
+}
+
 /*
  * Initialize Lua syscall integration
  * Called once during rules_init() to register C functions
@@ -14744,6 +15192,8 @@ void init_lua_syscall_functions(lua_State *L)
         /* Address translation */
         lua_register(L, "c_g2h", lua_g2h);
         lua_register(L, "c_h2g", lua_h2g);
+        lua_register(L, "c_resolve_addr", lua_resolve_addr);
+        lua_register(L, "c_resolve_host_addr", lua_resolve_host_addr);
 
         /* Memory access functions */
         lua_register(L, "c_read_guest_string", lua_read_guest_string);
@@ -14758,6 +15208,11 @@ void init_lua_syscall_functions(lua_State *L)
 
         /* Shadow call stack (requires -shadowstack on) */
         lua_register(L, "c_get_shadowstack", lua_get_shadowstack);
+
+        /* Emulation control helpers */
+        lua_register(L, "c_async_probe_http", lua_async_probe_http);
+        lua_register(L, "c_wait_user_continue", lua_wait_user_continue);
+        lua_register(L, "c_mkdir_p", lua_mkdir_p);
     }
 }
 
@@ -14824,6 +15279,9 @@ static const char *get_syscall_name(int num)
 #ifdef TARGET_NR_exit
         case TARGET_NR_exit: return "exit";
 #endif
+#ifdef TARGET_NR_exit_group
+        case TARGET_NR_exit_group: return "exit_group";
+#endif
 #ifdef TARGET_NR_fork
         case TARGET_NR_fork: return "fork";
 #endif
@@ -14854,116 +15312,229 @@ static const char *get_syscall_name(int num)
 }
 
 /*
- * Execute Lua syscall hook if available
- * Loads <rules_path>/<syscall_name>.lua on demand and executes it
- * The Lua script can call c_do_syscall() to invoke the original syscall
- * Returns:
- *   0: Continue with normal syscall execution (no Lua script found)
- *   1: Syscall was handled by Lua, ret contains the return value
+ * Execute Lua syscall hook if available (v2)
+ *
+ * 入口/结束脚本：
+ * - <rules_path>/entry.lua   : entry(syscall_name, num, arg1..arg8) -> (need_change, ret)
+ * - <rules_path>/finish.lua  : finish(syscall_name, num, ret, intercepted, arg1..arg8)
+ *
+ * 说明：
+ * - syscall_name 由 get_syscall_name() 进行“白名单映射”（未映射则传 nil 给 Lua）
+ * - Lua 脚本可调用 c_do_syscall() 执行原始 syscall（走 do_syscall1）
  */
-static int execute_lua_syscall_hook(CPUArchState *cpu_env, int num, abi_long *ret,
-                                     abi_long arg1, abi_long arg2, abi_long arg3,
-                                     abi_long arg4, abi_long arg5, abi_long arg6,
-                                     abi_long arg7, abi_long arg8)
+#define LUA_RULES_ENTRY_FILENAME  "entry.lua"
+#define LUA_RULES_FINISH_FILENAME "finish.lua"
+
+static bool lua_entry_checked;
+static bool lua_entry_available;
+static bool lua_finish_checked;
+static bool lua_finish_available;
+
+static int lua_load_and_exec_file(lua_State *L, const char *lua_file_path)
 {
-    const char *syscall_name;
+    if (luaL_loadfile(L, lua_file_path) != LUA_OK) {
+        fprintf(stderr, "Error loading Lua script '%s': %s\n",
+                lua_file_path, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return -1;
+    }
+    if (lua_pcall(L, 0, 0, 0) != LUA_OK) {
+        fprintf(stderr, "Error executing Lua script '%s': %s\n",
+                lua_file_path, lua_tostring(L, -1));
+        lua_pop(L, 1);
+        return -1;
+    }
+    return 0;
+}
+
+static bool ensure_lua_entry_loaded(void)
+{
     char lua_file_path[PATH_MAX];
 
-    /* Check if Lua state and rules path are initialized */
     if (!rules_lua_state || !rules_path) {
-        return 0;
+        return false;
+    }
+    if (lua_entry_checked) {
+        return lua_entry_available;
     }
 
-    /* Get syscall name */
-    syscall_name = get_syscall_name(num);
-    if (!syscall_name) {
-        /* No name mapping for this syscall number */
-        return 0;
-    }
+    lua_entry_checked = true;
+    snprintf(lua_file_path, sizeof(lua_file_path), "%s/%s",
+             rules_path, LUA_RULES_ENTRY_FILENAME);
 
-    /* Build the file path: <rules_path>/<syscall_name>.lua */
-    snprintf(lua_file_path, sizeof(lua_file_path), "%s/%s.lua",
-             rules_path, syscall_name);
-
-    /* Check if file exists */
     if (access(lua_file_path, F_OK) != 0) {
-        /* File doesn't exist, no hook for this syscall */
+        lua_entry_available = false;
+        return false;
+    }
+    if (lua_load_and_exec_file(rules_lua_state, lua_file_path) != 0) {
+        lua_entry_available = false;
+        return false;
+    }
+
+    lua_getglobal(rules_lua_state, "entry");
+    lua_entry_available = lua_isfunction(rules_lua_state, -1);
+    lua_pop(rules_lua_state, 1);
+
+    if (!lua_entry_available) {
+        fprintf(stderr, "Warning: '%s' does not define entry() function\n",
+                lua_file_path);
+    }
+
+    return lua_entry_available;
+}
+
+static bool ensure_lua_finish_loaded(void)
+{
+    char lua_file_path[PATH_MAX];
+
+    if (!rules_lua_state || !rules_path) {
+        return false;
+    }
+    if (lua_finish_checked) {
+        return lua_finish_available;
+    }
+
+    lua_finish_checked = true;
+    snprintf(lua_file_path, sizeof(lua_file_path), "%s/%s",
+             rules_path, LUA_RULES_FINISH_FILENAME);
+
+    if (access(lua_file_path, F_OK) != 0) {
+        lua_finish_available = false;
+        return false;
+    }
+    if (lua_load_and_exec_file(rules_lua_state, lua_file_path) != 0) {
+        lua_finish_available = false;
+        return false;
+    }
+
+    lua_getglobal(rules_lua_state, "finish");
+    lua_finish_available = lua_isfunction(rules_lua_state, -1);
+    lua_pop(rules_lua_state, 1);
+
+    if (!lua_finish_available) {
+        fprintf(stderr, "Warning: '%s' does not define finish() function\n",
+                lua_file_path);
+    }
+
+    return lua_finish_available;
+}
+
+static int execute_lua_syscall_entry(CPUArchState *cpu_env, const char *syscall_name,
+                                    int num, abi_long *out_ret,
+                                    abi_long arg1, abi_long arg2, abi_long arg3,
+                                    abi_long arg4, abi_long arg5, abi_long arg6,
+                                    abi_long arg7, abi_long arg8)
+{
+    lua_State *L = rules_lua_state;
+    int intercept = 0;
+    abi_long ret = 0;
+
+    if (!ensure_lua_entry_loaded()) {
         return 0;
     }
 
-    /* Save current CPU environment for c_do_syscall */
     current_cpu_env = cpu_env;
 
-    /* Load the Lua script */
-    if (luaL_loadfile(rules_lua_state, lua_file_path) != LUA_OK) {
-        fprintf(stderr, "Error loading Lua script '%s': %s\n",
-                lua_file_path, lua_tostring(rules_lua_state, -1));
-        lua_pop(rules_lua_state, 1);
+    lua_getglobal(L, "entry");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
         current_cpu_env = NULL;
         return 0;
     }
 
-    /* Execute the script (this defines functions and runs top-level code) */
-    if (lua_pcall(rules_lua_state, 0, 0, 0) != LUA_OK) {
-        fprintf(stderr, "Error executing Lua script '%s': %s\n",
-                lua_file_path, lua_tostring(rules_lua_state, -1));
-        lua_pop(rules_lua_state, 1);
+    if (syscall_name) {
+        lua_pushstring(L, syscall_name);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_pushinteger(L, num);
+    lua_pushinteger(L, arg1);
+    lua_pushinteger(L, arg2);
+    lua_pushinteger(L, arg3);
+    lua_pushinteger(L, arg4);
+    lua_pushinteger(L, arg5);
+    lua_pushinteger(L, arg6);
+    lua_pushinteger(L, arg7);
+    lua_pushinteger(L, arg8);
+
+    if (lua_pcall(L, 10, 2, 0) != LUA_OK) {
+        fprintf(stderr, "Error calling entry() for syscall %s: %s\n",
+                syscall_name ? syscall_name : "(nil)",
+                lua_tostring(L, -1));
+        lua_pop(L, 1);
         current_cpu_env = NULL;
         return 0;
     }
 
-    /* Get the do_syscall function from global scope */
-    lua_getglobal(rules_lua_state, "do_syscall");
-    if (!lua_isfunction(rules_lua_state, -1)) {
-        fprintf(stderr, "Warning: '%s' does not define do_syscall function\n",
-                lua_file_path);
-        lua_pop(rules_lua_state, 1);
-        current_cpu_env = NULL;
-        return 0;
+    if (lua_isboolean(L, -2)) {
+        intercept = lua_toboolean(L, -2) ? 1 : 0;
+    } else if (lua_isinteger(L, -2)) {
+        intercept = lua_tointeger(L, -2) ? 1 : 0;
+    } else {
+        intercept = 0;
     }
 
-    /* Push arguments to Lua */
-    lua_pushinteger(rules_lua_state, num);
-    lua_pushinteger(rules_lua_state, arg1);
-    lua_pushinteger(rules_lua_state, arg2);
-    lua_pushinteger(rules_lua_state, arg3);
-    lua_pushinteger(rules_lua_state, arg4);
-    lua_pushinteger(rules_lua_state, arg5);
-    lua_pushinteger(rules_lua_state, arg6);
-    lua_pushinteger(rules_lua_state, arg7);
-    lua_pushinteger(rules_lua_state, arg8);
-
-    /* Call do_syscall function with 9 arguments, expecting 2 results */
-    if (lua_pcall(rules_lua_state, 9, 2, 0) != LUA_OK) {
-        fprintf(stderr, "Error calling do_syscall in %s.lua: %s\n",
-                syscall_name, lua_tostring(rules_lua_state, -1));
-        lua_pop(rules_lua_state, 1);
-        current_cpu_env = NULL;
-        return 0; /* Continue with normal execution on error */
+    if (lua_isinteger(L, -1)) {
+        ret = (abi_long)lua_tointeger(L, -1);
+    } else {
+        ret = 0;
     }
 
-    /* Get the return values from Lua
-     * Lua should return: (intercept_flag, return_value)
-     * - intercept_flag: 0 = let original syscall run, 1 = intercept and use return_value
-     * - return_value: the value to return if intercepting
-     */
-    int intercept = 0;
-    if (lua_gettop(rules_lua_state) >= 2) {
-        /* Two return values: (intercept, ret) */
-        intercept = lua_tointeger(rules_lua_state, -2);
-        *ret = lua_tointeger(rules_lua_state, -1);
-        lua_pop(rules_lua_state, 2);
-    } else if (lua_gettop(rules_lua_state) >= 1) {
-        /* Single return value for backwards compatibility: treat as intercept flag only */
-        intercept = lua_tointeger(rules_lua_state, -1);
-        *ret = 0;
-        lua_pop(rules_lua_state, 1);
-    }
-
-    /* Clear current CPU environment */
+    lua_pop(L, 2);
     current_cpu_env = NULL;
 
-    return intercept; /* 1 = intercept, 0 = let original syscall run */
+    if (out_ret) {
+        *out_ret = ret;
+    }
+    return intercept;
+}
+
+static void execute_lua_syscall_finish(CPUArchState *cpu_env, const char *syscall_name,
+                                       int num, abi_long ret, int intercepted,
+                                       abi_long arg1, abi_long arg2, abi_long arg3,
+                                       abi_long arg4, abi_long arg5, abi_long arg6,
+                                       abi_long arg7, abi_long arg8)
+{
+    lua_State *L = rules_lua_state;
+
+    if (!ensure_lua_finish_loaded()) {
+        return;
+    }
+
+    current_cpu_env = cpu_env;
+
+    lua_getglobal(L, "finish");
+    if (!lua_isfunction(L, -1)) {
+        lua_pop(L, 1);
+        current_cpu_env = NULL;
+        return;
+    }
+
+    if (syscall_name) {
+        lua_pushstring(L, syscall_name);
+    } else {
+        lua_pushnil(L);
+    }
+    lua_pushinteger(L, num);
+    lua_pushinteger(L, ret);
+    lua_pushboolean(L, intercepted != 0);
+    lua_pushinteger(L, arg1);
+    lua_pushinteger(L, arg2);
+    lua_pushinteger(L, arg3);
+    lua_pushinteger(L, arg4);
+    lua_pushinteger(L, arg5);
+    lua_pushinteger(L, arg6);
+    lua_pushinteger(L, arg7);
+    lua_pushinteger(L, arg8);
+
+    if (lua_pcall(L, 12, 0, 0) != LUA_OK) {
+        fprintf(stderr, "Error calling finish() for syscall %s: %s\n",
+                syscall_name ? syscall_name : "(nil)",
+                lua_tostring(L, -1));
+        lua_pop(L, 1);
+    }
+
+    current_cpu_env = NULL;
 }
 
 static bool sys_dispatch(CPUState *cpu, TaskState *ts)
@@ -15033,29 +15604,23 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
         print_syscall(cpu_env, num, arg1, arg2, arg3, arg4, arg5, arg6);
     }
 
-    /* Check if there's a Lua hook for this syscall */
-    int lua_hook_result = execute_lua_syscall_hook(cpu_env, num, &ret,
-                                                     arg1, arg2, arg3, arg4,
-                                                     arg5, arg6, arg7, arg8);
+    const char *syscall_name = get_syscall_name(num);
+    int lua_intercept = execute_lua_syscall_entry(cpu_env, syscall_name, num, &ret,
+                                                  arg1, arg2, arg3, arg4,
+                                                  arg5, arg6, arg7, arg8);
 
-    if (lua_hook_result == 1) {
-        /* Syscall was handled by Lua script */
-        if (unlikely(qemu_loglevel_mask(LOG_STRACE))) {
-            print_syscall_ret(cpu_env, num, ret, arg1, arg2,
-                              arg3, arg4, arg5, arg6);
-        }
-        record_syscall_return(cpu, num, ret);
-        return ret;
+    if (lua_intercept != 1) {
+        ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,
+                          arg5, arg6, arg7, arg8);
     }
-
-    /* No Lua script found, execute normal syscall */
-    ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,
-                      arg5, arg6, arg7, arg8);
 
     if (unlikely(qemu_loglevel_mask(LOG_STRACE))) {
         print_syscall_ret(cpu_env, num, ret, arg1, arg2,
                           arg3, arg4, arg5, arg6);
     }
+
+    execute_lua_syscall_finish(cpu_env, syscall_name, num, ret, lua_intercept,
+                               arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8);
 
     record_syscall_return(cpu, num, ret);
     return ret;

@@ -22,3 +22,7 @@ GTAGS
 *.swp
 *.patch
 *.gcov
+
+# rules_examples 本地配置（可能包含密钥/令牌）
+/rules_examples/config/env
+/rules_examples/config/*.env

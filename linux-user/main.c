@@ -64,6 +64,7 @@
 #include "user-mmap.h"
 #include "tcg/perf.h"
 #include "exec/page-vary.h"
+#include "sfanalysis.h"
 
 #ifdef CONFIG_SEMIHOSTING
 #include "semihosting/semihost.h"
@@ -86,6 +87,8 @@ static const char *cpu_model;
 static const char *cpu_type;
 static const char *seed_optarg;
 const char *rules_path = NULL;  /* Exported for syscall.c */
+static unsigned long rules_ctx_keep = 256;
+static const char *sfanalysis_out_dir;
 unsigned long mmap_min_addr;
 uintptr_t guest_base;
 bool have_guest_base;
@@ -365,6 +368,20 @@ static void handle_arg_rules(const char *arg)
     rules_path = strdup(arg);
 }
 
+static void handle_arg_rules_ctx_keep(const char *arg)
+{
+    unsigned long val;
+    if (qemu_strtoul(arg, NULL, 0, &val)) {
+        usage(EXIT_FAILURE);
+    }
+    rules_ctx_keep = val;
+}
+
+static void handle_arg_sfanalysis(const char *arg)
+{
+    sfanalysis_out_dir = strdup(arg);
+}
+
 static void handle_arg_gdb(const char *arg)
 {
     gdbstub = g_strdup(arg);
@@ -550,6 +567,10 @@ static const struct qemu_argument arg_table[] = {
      "",           "Seed for pseudo-random number generator"},
     {"rules",      "QEMU_RULES",       true,  handle_arg_rules,
      "path",       "set the rules folder path"},
+    {"rules-ctx-keep", "QEMU_RULES_CTX_KEEP", true, handle_arg_rules_ctx_keep,
+     "n",          "syscall 上下文写入 rules/data 的保留数量（0=不落盘）"},
+    {"sfanalysis", "QEMU_SFANALYSIS",  true,  handle_arg_sfanalysis,
+     "path",       "设置 SFAnalysis 输出目录（用于地址->函数名/伪C 解析）"},
     {"trace",      "QEMU_TRACE",       true,  handle_arg_trace,
      "",           "[[enable=]<pattern>][,events=<file>][,file=<file>]"},
     {"shadowstack", "QEMU_SHADOWSTACK", true, handle_arg_shadowstack,
@@ -850,6 +871,12 @@ static void rules_init(const char *path) {
     /* Load standard Lua libraries */
     luaL_openlibs(rules_lua_state);
 
+    /* Export basic configuration to Lua */
+    lua_pushstring(rules_lua_state, path);
+    lua_setglobal(rules_lua_state, "SFEMU_RULES_PATH");
+    lua_pushinteger(rules_lua_state, (lua_Integer)rules_ctx_keep);
+    lua_setglobal(rules_lua_state, "SFEMU_SYSCALL_CTX_KEEP");
+
     /* Register C helper functions for Lua */
     lua_register(rules_lua_state, "c_log", lua_log_message);
     lua_register(rules_lua_state, "c_get_timestamp", lua_get_timestamp);
@@ -925,6 +952,18 @@ int main(int argc, char **argv, char **envp)
     qemu_plugin_add_opts();
 
     optind = parse_args(argc, argv);
+
+    /* Initialize SFAnalysis DB (optional) */
+    if (sfanalysis_out_dir && sfanalysis_out_dir[0]) {
+        g_autoptr(Error) err = NULL;
+        int rc = sfanalysis_init(sfanalysis_out_dir, &err);
+        if (rc < 0) {
+            error_report_err(err);
+        } else {
+            fprintf(stderr, "SFAnalysis 输出目录: %s\n", sfanalysis_out_dir);
+            fflush(stderr);
+        }
+    }
 
     /* Initialize rules if specified */
     rules_init(rules_path);

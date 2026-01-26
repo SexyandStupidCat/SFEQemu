@@ -15,6 +15,7 @@ linux_user_ss.add(files(
   'main.c',
   'mmap.c',
   'signal.c',
+  'sfanalysis.c',
   'strace.c',
   'syscall.c',
   'thunk.c',

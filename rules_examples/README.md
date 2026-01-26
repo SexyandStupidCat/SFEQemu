@@ -2,7 +2,18 @@
 
 ## 概述
 
-此目录包含 QEMU 用户模式 Lua 系统调用拦截的示例脚本。每个 `.lua` 文件对应一个系统调用。
+此目录包含 QEMU 用户模式 Lua 系统调用拦截的示例脚本。规则目录以 `--rules <dir>` 指定，推荐结构如下：
+
+```
+config/      # 配置（config/env 会被 entry.lua 自动加载）
+base/        # 通用基础模块（log、sftrace 等）
+data/        # 数据（预留）
+plugins/     # 插件目录
+  fakefile/  # fakefile 插件（含自身 config/data/default）
+syscall/     # 系统调用 hook（按 syscall 名命名，如 open.lua）
+entry.lua    # syscall 入口（每次 syscall 先进入这里）
+finish.lua   # syscall 结束（每次 syscall 结束进入这里）
+```
 
 ## 文件命名规范
 
@@ -11,7 +22,7 @@
 
 ## 脚本格式
 
-每个 Lua 脚本必须定义一个 `do_syscall` 函数：
+每个 `syscall/<name>.lua` 脚本必须定义一个 `do_syscall` 函数：
 
 ```lua
 function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
@@ -86,15 +97,9 @@ local str = c_read_string(pathname)
 
 ## 使用方法
 
-1. **创建规则目录**：
+1. **创建规则目录**（建议直接复制本目录结构）：
    ```bash
-   mkdir my_rules
-   ```
-
-2. **复制或创建规则文件**：
-   ```bash
-   cp rules_examples/write.lua my_rules/
-   cp rules_examples/getpid.lua my_rules/
+   cp -r rules_examples my_rules
    ```
 
 3. **运行 QEMU**：
@@ -103,8 +108,8 @@ local str = c_read_string(pathname)
    ```
 
 4. **观察输出**：
-   - 第一次调用某个系统调用时，对应的 `.lua` 文件会被加载
-   - 后续调用会使用缓存的函数，无需重新加载
+   - 每次系统调用会先进入 `entry.lua`，由它在 `syscall/` 目录中按名称分发并执行 hook
+   - 系统调用完成后会进入 `finish.lua`（可记录返回值/执行结果）
 
 ## 示例场景
 

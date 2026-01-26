@@ -29,6 +29,8 @@ QEMU 已经注册了大量的 C 函数供 Lua 脚本调用，提供了强大的�
 ### 🔄 地址转换
 - `c_g2h(guest_addr)` - 客户机地址转主机地址
 - `c_h2g(host_addr)` - 主机地址转客户机地址
+- `c_resolve_addr(guest_addr[, max_pseudocode_bytes])` - 地址解析为函数名/伪C（需 `--sfanalysis`）
+- `c_resolve_host_addr(host_addr_or_ptr[, max_pseudocode_bytes])` - 按 host 地址解析为函数名/伪C（需 `--sfanalysis`）
 
 ### 🔧 系统调用
 - `c_do_syscall(num, ...)` - 执行原始系统调用

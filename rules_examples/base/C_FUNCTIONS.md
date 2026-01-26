@@ -225,19 +225,19 @@ local written, rc = c_set_reg("v0", raw_data)
 - `guest_addr` (number): 客户机虚拟地址
 
 **返回值:**
-- `host_addr` (number): 主机地址
+- `host_addr` (lightuserdata): 主机地址（Lua 中用 `tostring(host_addr)` 查看）
 
 **示例:**
 ```lua
 local host_addr = c_g2h(guest_addr)
-log.info("Guest 0x%x -> Host 0x%x", guest_addr, host_addr)
+log.info("Guest 0x%x -> Host %s", guest_addr, tostring(host_addr))
 ```
 
 ### `c_h2g(host_addr)`
 将主机地址转换为客户机地址（Host to Guest）
 
 **参数:**
-- `host_addr` (number): 主机地址
+- `host_addr` (lightuserdata): 主机地址（通常来自 `c_g2h`）
 
 **返回值:**
 - `guest_addr` (number): 客户机虚拟地址
@@ -245,6 +245,56 @@ log.info("Guest 0x%x -> Host 0x%x", guest_addr, host_addr)
 **示例:**
 ```lua
 local guest_addr = c_h2g(host_addr)
+```
+
+### `c_resolve_addr(guest_addr[, max_pseudocode_bytes])`
+基于 `--sfanalysis <out_dir>` 指定的 SFAnalysis 输出目录，将地址解析为“模块/函数名/伪C”。
+
+**参数:**
+- `guest_addr` (number): guest 虚拟地址（例如 shadowstack 回溯地址）
+- `max_pseudocode_bytes` (number, optional): 读取伪C的最大字节数，默认 `4096`，传 `0` 可跳过读取
+
+**返回值:**
+- `info` (table|nil): 解析结果表（失败时为 nil）
+- `rc` (number): 结果码（0 表示成功，失败时为负 errno）
+
+**info 字段（常用）:**
+- `map_path`: 命中的 `/proc/self/maps` 文件路径
+- `load_bias`: 模块加载基址（`analysis_addr = addr - load_bias`）
+- `analysis_addr`: 用于在 SFAnalysis JSON 中查询的地址
+- `module_name` / `module_real_path`: SFAnalysis 中的模块信息
+- `func_name` / `func_entry` / `func_offset` / `prototype`: 函数信息（可能为空）
+- `pseudocode_file` / `pseudocode` / `pseudocode_truncated`: 伪C路径与内容（可选）
+
+**示例:**
+```lua
+local info, rc = c_resolve_addr(retaddr, 2048)
+if rc == 0 and info and info.func_name then
+    c_log(string.format("0x%x -> %s+0x%x", retaddr, info.func_name, info.func_offset))
+end
+```
+
+### `c_resolve_host_addr(host_addr_or_ptr[, max_pseudocode_bytes])`
+基于 `--sfanalysis <out_dir>` 指定的 SFAnalysis 输出目录，**按 host 地址**将地址解析为“模块/函数名/伪C”。
+
+**参数:**
+- `host_addr_or_ptr` (number|lightuserdata):
+  - `number`：host 虚拟地址（例如 shadowstack 返回的是 host 地址时直接传）
+  - `lightuserdata`：host 指针（可由 `c_g2h(guest_addr)` 获得）
+- `max_pseudocode_bytes` (number, optional): 读取伪C的最大字节数，默认 `4096`，传 `0` 可跳过读取
+
+**返回值:**
+- `info` (table|nil): 解析结果表（失败时为 nil）
+- `rc` (number): 结果码（0 表示成功，失败时为负 errno）
+
+**示例:**
+```lua
+-- 1) shadowstack 返回 host 地址（number）
+local info, rc = c_resolve_host_addr(retaddr_host, 2048)
+
+-- 2) shadowstack 返回 guest 地址（number），先 g2h 再按 host 解析
+local host_ptr = c_g2h(retaddr_guest)
+local info2, rc2 = c_resolve_host_addr(host_ptr, 2048)
 ```
 
 ## 系统调用

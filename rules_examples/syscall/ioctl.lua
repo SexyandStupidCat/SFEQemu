@@ -3,7 +3,9 @@
 
 -- 加载网络模块
 local script_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or ""
-local net = require(script_dir .. "base/net")
+local rules_dir = script_dir:gsub("syscall/?$", "")
+local fakefile = require(rules_dir .. "plugins/fakefile")
+local net = require(rules_dir .. "base/net")
 
 -- 统计计数器
 local ioctl_count = 0
@@ -11,6 +13,12 @@ local cmd_stats = {}
 
 -- 主处理函数
 function do_syscall(num, fd, cmd, arg, arg4, arg5, arg6, arg7, arg8)
+    -- fakefile 优先处理（命中后直接拦截返回）
+    local action, retval = fakefile.handle_ioctl(num, fd, cmd, arg, arg4, arg5, arg6, arg7, arg8)
+    if action == 1 then
+        return action, retval
+    end
+
     ioctl_count = ioctl_count + 1
 
     local cmd_name = net.get_cmd_name(cmd)

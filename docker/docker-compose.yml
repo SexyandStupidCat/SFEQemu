@@ -1,0 +1,18 @@
+version: '3.8'
+
+services:
+  sfemu:
+    image: sfemu-ubuntu2404:local
+    container_name: sfemu-container
+    build:
+      context: .
+      dockerfile: Dockerfile
+    privileged: true  # 如不需要可去掉
+    stdin_open: true  # 等同于 -i
+    tty: true         # 等同于 -t
+    environment:
+      - TERM=${TERM:-xterm-256color}
+    volumes:
+      - ./rootfs:/rootfs:rw
+    working_dir: /rootfs
+    command: ["/bin/bash"]

@@ -15,12 +15,37 @@ local function log(fmt, ...)
     end
 end
 
+-- syscall_name 可能为 nil（C 侧映射表不全）。这里补充一小段“按 syscall 号反查名称”，
+-- 保证 sendmsg/recvmsg 等网络相关 syscall 也能正确落盘/打印。
+--
+-- 说明：这些号以 ARM EABI 为准（与本项目已有日志一致：socket=281, connect=283, openat=322）。
+local SYSCALL_NUM_TO_NAME = {
+    [289] = "send",
+    [290] = "sendto",
+    [291] = "recv",
+    [292] = "recvfrom",
+    [296] = "sendmsg",
+    [297] = "recvmsg",
+}
+
 function finish(syscall_name, num, ret, intercepted, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
     local ctx = _G._sfemu_syscall_ctx
     if type(ctx) ~= "table" or ctx.hooked ~= true then
         return 0
     end
-    if ctx.name ~= syscall_name then
+
+    -- C 侧未提供 syscall_name 时，尝试用 num 反查；若仍无法反查，则使用 ctx.name 作为兜底展示名
+    if type(syscall_name) ~= "string" or syscall_name == "" then
+        if type(num) == "number" then
+            syscall_name = SYSCALL_NUM_TO_NAME[num]
+        end
+        if type(syscall_name) ~= "string" or syscall_name == "" then
+            syscall_name = ctx.name
+        end
+    end
+
+    -- 以 syscall 号为准做一致性校验，避免因 name 缺失导致无法写回 ret/无法清理 ctx
+    if type(ctx.num) == "number" and type(num) == "number" and ctx.num ~= num then
         return 0
     end
 

@@ -159,18 +159,30 @@ local function load_handler_env(syscall_name)
     end
 
     -- 规则加载优先级：
-    -- 1) syscall_override/<name>.lua（AI/临时修复，不覆盖原规则）
+    -- 1) syscall_override_user/<name>.lua（本地临时修复，通常由人工快速迭代）
+    -- 2) syscall_override/<name>.lua（AI/临时修复，不覆盖原规则）
     -- 2) syscall/<name>.lua（基础规则）
     local function resolve_rule_path(name)
         local od = rawget(_G, "SFEMU_RULES_OVERRIDE_DIR")
         if type(od) ~= "string" or od == "" then
-            od = "syscall_override"
+            -- 默认：先查用户临时 override，再查 AI 生成 override（若目录不存在则自动跳过）
+            od = "syscall_override_user:syscall_override"
         end
-        od = tostring(od):gsub("/+$", "")
 
-        local p1 = rules_dir .. od .. "/" .. name .. ".lua"
-        if file_exists(p1) then
-            return p1
+        -- 支持使用 ':' 指定多个 override 目录（类似 PATH）
+        for dir in tostring(od):gmatch("[^:]+") do
+            dir = tostring(dir):gsub("^%s+", ""):gsub("%s+$", ""):gsub("/+$", "")
+            if dir ~= "" then
+                local p1
+                if dir:sub(1, 1) == "/" then
+                    p1 = dir .. "/" .. name .. ".lua"
+                else
+                    p1 = rules_dir .. dir .. "/" .. name .. ".lua"
+                end
+                if file_exists(p1) then
+                    return p1
+                end
+            end
         end
         local p2 = rules_dir .. "syscall/" .. name .. ".lua"
         if file_exists(p2) then

@@ -35,6 +35,53 @@ local function file_exists(path)
     return false
 end
 
+-- 通用开关解析（auto_ai / SFEMU_AUTO_AI 等）
+local util_checked = false
+local util_mod = nil
+
+local function str_bool(v, default)
+    if v == nil then
+        return default
+    end
+
+    if not util_checked then
+        util_checked = true
+        local ok, mod = pcall(require, rules_dir .. "base/util")
+        if ok and type(mod) == "table" and type(mod.str_bool) == "function" then
+            util_mod = mod
+        end
+    end
+
+    if util_mod and type(util_mod.str_bool) == "function" then
+        return util_mod.str_bool(v, default)
+    end
+
+    -- 兜底：最小实现
+    if v == true or v == 1 then
+        return true
+    end
+    if v == false or v == 0 then
+        return false
+    end
+    local s = tostring(v):lower()
+    if s == "1" or s == "true" or s == "on" or s == "yes" then
+        return true
+    end
+    if s == "0" or s == "false" or s == "off" or s == "no" then
+        return false
+    end
+    return default
+end
+
+local function auto_ai_enabled()
+    -- 兼容多种命名：auto_ai（推荐，最短）、SFEMU_AUTO_AI（更语义化）
+    local v = rawget(_G, "auto_ai")
+    if v == nil then
+        v = rawget(_G, "SFEMU_AUTO_AI")
+    end
+    return str_bool(v, false)
+end
+
 -- 加载 config/env（可选）：集中管理 AI/规则相关配置（例如 OPENAI_*、SFEMU_AI_*）
 do
     local env_path = rules_dir .. "config/env"
@@ -56,13 +103,27 @@ do
     end
 end
 
+-- 启动前自检/补齐：某些固件 rootfs 解包后权限/目录/证书不完整，会导致 httpd 早退。
+-- 这里把“必要但无副作用”的补齐动作放在入口处，确保在业务代码启动前完成。
+do
+    local ok, mod = pcall(require, rules_dir .. "base/bootstrap_fs")
+    if ok and type(mod) == "table" and type(mod.bootstrap) == "function" then
+        local ok2, err = pcall(mod.bootstrap)
+        if not ok2 then
+            log("bootstrap_fs 执行失败：%s", tostring(err))
+        end
+    elseif not ok then
+        log("加载 bootstrap_fs 失败：%s", tostring(mod))
+    end
+end
+
 -- syscall_name -> env(do_syscall)
 local handler_cache = {}
 -- syscall_name -> true（不存在或加载失败，避免每次都做 I/O）
 local missing_cache = {}
 
 local CFG = {
-    -- 写入 rules/data/ 的上下文保留数量（0=不落盘；由 qemu-user 启动参数 --rules-ctx-keep 设置）
+    -- 写入 rules/cache/ 的上下文保留数量（0=不落盘；由 qemu-user 启动参数 --rules-ctx-keep 设置）
     ctx_keep = tonumber(rawget(_G, "SFEMU_SYSCALL_CTX_KEEP")) or 256,
 
     -- backtrace 采集/用于签名的最大帧数
@@ -72,6 +133,8 @@ local CFG = {
     -- 死循环检测：寻找“重复序列”
     loop_max_seq_len = 8,
     loop_min_repeats = 3,
+    -- 死循环检测的时间窗：仅把“短时间内高频重复”的序列视为死循环（避免将周期性轮询误判为死循环）
+    loop_max_span_ms = tonumber(rawget(_G, "SFEMU_LOOP_MAX_SPAN_MS")) or 500,
 
     -- 触发交互后，允许继续运行的 syscall 数（用来观察是否被打破）
     probe_grace_syscalls = 64,
@@ -90,7 +153,22 @@ local SYSCALL_NUM_TO_NAME = {
     [297] = "recvmsg",
 }
 
-local data_dir = rules_dir .. "data/"
+-- cache/：用于落盘 syscall 上下文、死循环报告、AI 快照与稳定规则等
+local function ensure_dir(path)
+    if type(path) ~= "string" or path == "" then
+        return false
+    end
+    if type(c_mkdir_p) == "function" then
+        local ok = pcall(c_mkdir_p, path, 493) -- 0755
+        return ok
+    end
+    local cmd = string.format("mkdir -p %q >/dev/null 2>&1", path)
+    local r1, _r2, r3 = os.execute(cmd)
+    return r1 == true or r1 == 0 or r3 == 0
+end
+
+local cache_dir = rules_dir .. "cache/"
+ensure_dir(cache_dir)
 local state = {
     seq = 0,
     keys = {},
@@ -154,9 +232,6 @@ local function load_handler_env(syscall_name)
     if handler_cache[syscall_name] then
         return handler_cache[syscall_name]
     end
-    if missing_cache[syscall_name] then
-        return nil
-    end
 
     -- 规则加载优先级：
     -- 1) syscall_override_user/<name>.lua（本地临时修复，通常由人工快速迭代）
@@ -191,10 +266,28 @@ local function load_handler_env(syscall_name)
         return nil
     end
 
+    -- 重要：AI 可能在运行中生成新规则文件。
+    -- 若之前该 syscall 缺失导致 missing_cache 命中，则这里需要“有条件地破缓存”：
+    -- - 仅当 override 目录中出现了新文件时才清理 missing_cache 并尝试加载；
+    -- - 避免在正常情况下每次都触发 I/O。
+    if missing_cache[syscall_name] then
+        local p_user = rules_dir .. "syscall_override_user/" .. syscall_name .. ".lua"
+        local p_ai = rules_dir .. "syscall_override/" .. syscall_name .. ".lua"
+        if file_exists(p_user) or file_exists(p_ai) then
+            missing_cache[syscall_name] = nil
+        else
+            return nil
+        end
+    end
+
     local path = resolve_rule_path(syscall_name)
     if not path then
         missing_cache[syscall_name] = true
         return nil
+    end
+
+    if str_bool(rawget(_G, "SFEMU_LOG_RULE_LOAD"), false) then
+        log("加载规则：%s -> %s", tostring(syscall_name), tostring(path))
     end
 
     local env = setmetatable({}, { __index = _G })
@@ -274,11 +367,11 @@ local function write_ctx_to_data_dir(ctx)
     end
 
     local safe_name = tostring(ctx.name or "nil"):gsub("[^%w_%-%.]", "_")
-    local path = string.format("%ssyscall_ctx_%08d_%s.txt", data_dir, ctx.seq, safe_name)
+    local path = string.format("%ssyscall_ctx_%08d_%s.txt", cache_dir, ctx.seq, safe_name)
 
     local f = io.open(path, "wb")
     if not f then
-        log("写入失败：%s（请确认 data/ 目录存在且可写）", path)
+        log("写入失败：%s（请确认 cache/ 目录存在且可写）", path)
         return nil
     end
 
@@ -362,10 +455,10 @@ local function dump_deadloop_report(seq_len, repeats)
         return nil
     end
 
-    local path = string.format("%sdeadloop_%08d.log", data_dir, state.seq)
+    local path = string.format("%sdeadloop_%08d.log", cache_dir, state.seq)
     local f = io.open(path, "wb")
     if not f then
-        log("写入失败：%s（请确认 data/ 目录存在且可写）", path)
+        log("写入失败：%s（请确认 cache/ 目录存在且可写）", path)
         return nil
     end
 
@@ -424,6 +517,24 @@ local function check_status(ctx)
         return true
     end
 
+    -- 仅把“短时间内高频重复”的序列视为死循环：如果跨度太大，多半是正常周期性轮询（例如 netlink 周期查询）。
+    do
+        local need = seq_len * repeats
+        if need > 0 and #state.ctxs >= need then
+            local first = state.ctxs[#state.ctxs - need + 1]
+            local last = state.ctxs[#state.ctxs]
+            if first and last and first.ts_sec ~= nil and last.ts_sec ~= nil then
+                local t1 = (tonumber(first.ts_sec) or 0) * 1000 + (tonumber(first.ts_nsec) or 0) / 1e6
+                local t2 = (tonumber(last.ts_sec) or 0) * 1000 + (tonumber(last.ts_nsec) or 0) / 1e6
+                local span = t2 - t1
+                if span > (CFG.loop_max_span_ms or 500) then
+                    reset_loop_state()
+                    return true
+                end
+            end
+        end
+    end
+
     if not state.loop.active then
         state.loop.active = true
         state.loop.probe_started = false
@@ -464,6 +575,11 @@ local function pause_and_wait_handle(ctx)
 end
 
 local function need_ai(ctx)
+    -- auto_ai=1：强制开启 AI 干预（并由 base/ai.lua 自动设置 auto_continue，不再询问 YES）
+    if auto_ai_enabled() then
+        return true
+    end
+
     local v = rawget(_G, "SFEMU_AI_ENABLE")
     if v == nil then
         -- 兼容旧开关：SFEMU_NEED_AI
@@ -475,6 +591,183 @@ local function need_ai(ctx)
         return true
     end
     return v == true or v == 1 or tostring(v) == "1" or tostring(v) == "true" or tostring(v) == "on"
+end
+
+local function reexec_on_exit_fix_enabled()
+    -- 是否在 exit/exit_group + “AI 已应用修复规则”后，触发 re-exec 重新跑一遍。
+    --
+    -- 背景：
+    -- - linux-user 模式下，exit/exit_group 会导致整个 QEMU 进程退出；
+    -- - 但 AI 往往在“即将退出”的失败路径上补规则（如补文件/改返回值），需要重跑一次才能验证修复是否生效；
+    -- - 因此这里默认开启（可通过 SFEMU_AI_REEXEC_ON_EXIT_FIX=0 关闭）。
+    local v = rawget(_G, "SFEMU_AI_REEXEC_ON_EXIT_FIX")
+    if v == nil then
+        return true
+    end
+    return v == true or v == 1 or tostring(v) == "1" or tostring(v) == "true" or tostring(v) == "on"
+end
+
+local function ai_repair_on_error_enabled()
+    -- 是否在“关键 syscall 返回错误”时触发 AI 干预并尝试在该 syscall 处完成重试（避免走到 exit）。
+    --
+    -- 说明：
+    -- - 该模式用于“修复出错的 syscall 并在同一 syscall 点重试”，而不是等到 exit 才介入；
+    -- - 默认开启（只对少量关键 syscall 生效），可通过 SFEMU_AI_REPAIR_ON_ERROR=0 关闭。
+    local v = rawget(_G, "SFEMU_AI_REPAIR_ON_ERROR")
+    if v == nil then
+        return true
+    end
+    return v == true or v == 1 or tostring(v) == "1" or tostring(v) == "true" or tostring(v) == "on"
+end
+
+local ai_repair_syscalls_checked = false
+local ai_repair_syscalls = nil
+
+local function parse_csv_set(s)
+    local out = {}
+    if type(s) ~= "string" then
+        return out
+    end
+    for part in s:gmatch("[^,]+") do
+        local k = tostring(part):gsub("^%s+", ""):gsub("%s+$", "")
+        if k ~= "" then
+            out[k] = true
+        end
+    end
+    return out
+end
+
+local function get_ai_repair_syscalls()
+    if ai_repair_syscalls_checked then
+        return ai_repair_syscalls
+    end
+    ai_repair_syscalls_checked = true
+
+    -- 默认仅覆盖“高频根因”且相对安全的 syscall
+    local s = rawget(_G, "SFEMU_AI_REPAIR_SYSCALLS")
+    if type(s) ~= "string" or s == "" then
+        s = "open,openat,access,ioctl"
+    end
+    ai_repair_syscalls = parse_csv_set(s)
+    return ai_repair_syscalls
+end
+
+local ai_repair_errnos_checked = false
+local ai_repair_errnos = nil
+
+local function get_ai_repair_errnos()
+    if ai_repair_errnos_checked then
+        return ai_repair_errnos
+    end
+    ai_repair_errnos_checked = true
+
+    -- 默认覆盖：
+    -- EPERM(1) / ENOENT(2) / EACCES(13) / ENODEV(19) / EINVAL(22) / ENOTTY(25)
+    local s = rawget(_G, "SFEMU_AI_REPAIR_ERRNOS")
+    if type(s) ~= "string" or s == "" then
+        s = "1,2,13,19,22,25"
+    end
+    local set = {}
+    for part in tostring(s):gmatch("[^,]+") do
+        local n = tonumber((tostring(part):gsub("^%s+", ""):gsub("%s+$", "")))
+        if n and n >= 0 then
+            set[n] = true
+        end
+    end
+    ai_repair_errnos = set
+    return ai_repair_errnos
+end
+
+local function should_ai_repair_ret(ret)
+    if type(ret) ~= "number" or ret >= 0 then
+        return false, nil
+    end
+    local eno = -ret
+    local allow = get_ai_repair_errnos()
+    return allow[eno] == true, eno
+end
+
+local function maybe_ai_repair_and_retry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+    if not ai_repair_on_error_enabled() then
+        return nil
+    end
+    if type(syscall_name) ~= "string" or syscall_name == "" then
+        return nil
+    end
+    local wl = get_ai_repair_syscalls()
+    if not wl[syscall_name] then
+        return nil
+    end
+    if type(c_do_syscall) ~= "function" then
+        log("启用 AI_REPAIR_ON_ERROR 但未找到 c_do_syscall，跳过")
+        return nil
+    end
+
+    -- 1) 先执行一次真实 syscall，获取错误码（这是“读取之前上下文并修复出错 syscall”的关键证据）
+    local ret0 = c_do_syscall(num, arg1 or 0, arg2 or 0, arg3 or 0, arg4 or 0, arg5 or 0, arg6 or 0, arg7 or 0, arg8 or 0)
+    local ctx = _G._sfemu_syscall_ctx
+    if type(ctx) == "table" then
+        ctx.ret = ret0
+        ctx.intercepted = true
+    end
+
+    if type(ret0) ~= "number" then
+        ret0 = 0
+    end
+    if ret0 >= 0 then
+        -- syscall 成功：直接返回该结果（避免 C 侧再执行一次）
+        return true, ret0
+    end
+
+    local ok_eno, eno = should_ai_repair_ret(ret0)
+    if not ok_eno then
+        return true, ret0
+    end
+
+    -- 2) syscall 失败：触发 AI（在“出错 syscall 点”介入，而不是等到 exit）
+    local ai_on = need_ai(ctx)
+    log("syscall_error 触发：name=%s ret=%s errno=%s need_ai=%s", tostring(syscall_name), tostring(ret0), tostring(eno), tostring(ai_on))
+    if not ai_on then
+        return true, ret0
+    end
+
+    local res = ai_handle(ctx, {
+        reason = "syscall_error",
+        errno = eno,
+        last_ret = ret0,
+    })
+
+    local applied_fix = (type(res) == "table" and type(res.applied_fix_syscalls) == "table") and #res.applied_fix_syscalls or 0
+    if not (type(res) == "table" and res.auto_continue == true and applied_fix > 0) then
+        return true, ret0
+    end
+
+    -- 3) AI 已应用修复：优先“走规则拦截”重试（因为很多修复是 syscall_override/<name>.lua）
+    invalidate_handler(syscall_name)
+    local env = load_handler_env(syscall_name)
+    if env and type(env.do_syscall) == "function" then
+        local ok2, action2, ret2 = pcall(env.do_syscall, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+        if ok2 then
+            local need_change2 = (action2 == true) or (action2 == 1)
+            if need_change2 and type(ret2) == "number" then
+                if type(ctx) == "table" then
+                    ctx.ret = ret2
+                end
+                log("syscall_error：规则拦截生效，重试成功：%s ret=%s", tostring(syscall_name), tostring(ret2))
+                return true, ret2
+            end
+        else
+            log("syscall_error：重试阶段 env.do_syscall 异常：%s", tostring(action2))
+        end
+    end
+
+    -- 4) 若规则未拦截，则再次执行真实 syscall（适用于“补文件/补目录/补设备节点”等环境修复）
+    local ret1 = c_do_syscall(num, arg1 or 0, arg2 or 0, arg3 or 0, arg4 or 0, arg5 or 0, arg6 or 0, arg7 or 0, arg8 or 0)
+    if type(ctx) == "table" then
+        ctx.ret = ret1
+    end
+    log("syscall_error：重试真实 syscall：%s ret=%s (原 ret=%s)", tostring(syscall_name), tostring(ret1), tostring(ret0))
+    return true, ret1
 end
 
 local function ai_handle(ctx, meta)
@@ -517,11 +810,21 @@ local function ai_handle(ctx, meta)
             invalidate_handler(name)
         end
     end
+    if type(res) == "table" and type(res.applied_fix_syscalls) == "table" then
+        for _, name in ipairs(res.applied_fix_syscalls) do
+            invalidate_handler(name)
+        end
+    end
 
     return res or { auto_continue = false }
 end
 
 local function manual_handle(ctx)
+    if auto_ai_enabled() then
+        log("auto_ai=1：跳过人工确认（不再等待 YES）")
+        reset_loop_state()
+        return
+    end
     if type(c_wait_user_continue) == "function" then
         c_wait_user_continue("检测到仿真异常/死循环，输入 YES 继续运行: ")
         reset_loop_state()
@@ -636,6 +939,20 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
         if not (type(res) == "table" and res.auto_continue == true) then
             manual_handle(_G._sfemu_syscall_ctx)
         end
+
+        -- 关键：若 AI 已应用修复规则且允许自动继续，则触发 re-exec 重新运行目标程序，
+        -- 否则本次 exit/exit_group 会直接把 QEMU 进程带走，无法完成“重试验证”。
+        local applied_fix = (type(res) == "table" and type(res.applied_fix_syscalls) == "table") and #res.applied_fix_syscalls or 0
+        if applied_fix > 0 and type(res) == "table" and res.auto_continue == true and reexec_on_exit_fix_enabled() then
+            if type(c_request_reexec) == "function" then
+                log("exit：AI 已应用修复规则（%d 个），触发 re-exec 重新加载镜像并重试验证", applied_fix)
+                pcall(c_request_reexec, tostring(res.run_id or ""))
+                -- 不拦截 exit：让 C 侧看到“需要 re-exec”后立刻 execv 重新跑；拦截 exit 会导致 guest 走到不可预期分支/反复 exit。
+                return false, 0
+            else
+                log("exit：需要 re-exec，但未找到 c_request_reexec（请更新/重编译 QEMU）")
+            end
+        end
     else
         if not check_status(_G._sfemu_syscall_ctx) then
             pause_and_wait_handle(_G._sfemu_syscall_ctx)
@@ -684,10 +1001,13 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
         end
     end
 
-
-
     local env = load_handler_env(syscall_name)
     if not env then
+        -- 当没有对应规则脚本时，允许在“关键 syscall 失败”处触发 AI 并在该 syscall 点完成重试
+        local handled, r = maybe_ai_repair_and_retry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+        if handled ~= nil then
+            return handled, r or 0
+        end
         return false, 0
     end
 

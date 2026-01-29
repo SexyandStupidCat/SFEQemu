@@ -33,7 +33,7 @@ function do_syscall(num, fd, buf, count, arg4, arg5, arg6, arg7, arg8)
 
     -- 调用栈符号化：封装在 base/sftrace.lua，默认优先按 host 地址解析
     local stack = c_get_shadowstack()
-    sftrace.log_addrs(stack, { max_pseudocode_bytes = 2048 })
+    -- sftrace.log_addrs(stack, { max_pseudocode_bytes = 2048 })
 
     local action, retval = fakefile.handle_write(num, fd, orig_buf, orig_count, arg4, arg5, arg6, arg7, arg8)
     if action == 1 then

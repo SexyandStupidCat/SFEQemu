@@ -1,0 +1,11 @@
+# rules_examples/cache/
+# 说明：本目录用于运行时缓存/落盘输出（不属于“基础规则实现”）。
+#
+# - ai_runs/：AI 触发时的每次运行快照（包含 snapshot.json、诊断、规则 patch 等）
+# - syscall_ctx_*.txt / deadloop_*.log：entry.lua 落盘的上下文与死循环报告
+#
+# stable_rules/（稳定规则导出目录）默认不忽略，便于你按需提交/同步。
+
+ai_runs/
+syscall_ctx_*.txt
+deadloop_*.log

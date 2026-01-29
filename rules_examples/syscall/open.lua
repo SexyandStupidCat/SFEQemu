@@ -10,6 +10,45 @@ local rules_dir = script_dir:gsub("syscall/?$", "")
 local fakefile = require(rules_dir .. "plugins/fakefile")
 local fdmap = require(rules_dir .. "base/fdmap")
 
+local O_CREAT = 0x40
+
+local function dirname(path)
+    local p = tostring(path or "")
+    if p == "" then
+        return nil
+    end
+    if p ~= "/" then
+        p = p:gsub("/+$", "")
+    end
+    if p == "" or p == "/" then
+        return "/"
+    end
+    local d = p:match("^(.*)/[^/]+$") or ""
+    if d == "" then
+        if p:sub(1, 1) == "/" then
+            return "/"
+        end
+        return "."
+    end
+    return d
+end
+
+local function should_skip_dir(d)
+    if not d or d == "" or d == "." or d == "/" then
+        return true
+    end
+    if d == "/proc" or d:match("^/proc/") then
+        return true
+    end
+    if d == "/sys" or d:match("^/sys/") then
+        return true
+    end
+    if d == "/dev" or d:match("^/dev/") then
+        return true
+    end
+    return false
+end
+
 local function classify_path(path)
     if type(path) ~= "string" or path == "" then
         return "file"
@@ -26,20 +65,58 @@ local function classify_path(path)
     return "file"
 end
 
-function do_syscall(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)
-    -- 先执行 open 自己的逻辑（日志/统计），再交给 fakefile 做缺失资源补全
-    local path = ""
-    if pathname ~= 0 then
-        local p, rc = c_read_string(pathname, 4096)
-        if rc == 0 and p and p ~= "" then
-            path = p
+local function read_pathname(pathname)
+    if pathname == 0 then
+        return "", -1
+    end
+
+    -- 说明：c_read_string 内部会 lock_user(max_len)，如果 max_len 太大且跨越未映射页，
+    -- 即使真实路径很短也可能读取失败（例如临近页边界的字符串指针）。
+    -- 因此这里采用“从小到大”探测，尽量稳定拿到路径文本用于日志与规则匹配。
+    local lens = { 256, 1024, 4096 }
+    for _, max_len in ipairs(lens) do
+        local p, rc = c_read_string(pathname, max_len)
+        if rc == 0 and p and p ~= "" and p ~= "(null)" then
+            return p, 0
         end
     end
+
+    local _, rc = c_read_string(pathname, 256)
+    return "", rc
+end
+
+function do_syscall(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)
+    -- 先执行 open 自己的逻辑（日志/统计），再交给 fakefile 做缺失资源补全
+    local path, path_rc = read_pathname(pathname)
 
     if path ~= "" then
         c_log(string.format("[open] %s flags=0x%x mode=0x%x", path, flags, mode))
     else
         c_log(string.format("[open] pathname=0x%x flags=0x%x mode=0x%x", pathname, flags, mode))
+    end
+
+    -- 额外输出一条更便于 grep/解析的目标路径日志
+    if path ~= "" then
+        c_log(string.format("[open.target] %s", path))
+    else
+        c_log(string.format("[open.target] (unreadable pathname=0x%x rc=%d)", pathname, path_rc or -1))
+    end
+
+    -- 带创建语义的 open（O_CREAT）不做任何干预：直接走原始 syscall。
+    -- 说明：O_CREAT 只能创建“文件本身”，不会创建父目录；父目录缺失应由 bootstrap 提前补齐。
+    flags = math.floor(tonumber(flags) or 0)
+    if (flags & O_CREAT) ~= 0 then
+        -- 如果父目录不存在，先递归创建父目录，再返回去执行原始 open。
+        if path ~= "" and type(c_mkdir_p) == "function" then
+            local d = dirname(path)
+            if not should_skip_dir(d) then
+                local ok, rc = c_mkdir_p(d, 493) -- 0755
+                if not ok then
+                    c_log(string.format("[open.creat] mkdir_p failed dir=%s rc=%s", tostring(d), tostring(rc)))
+                end
+            end
+        end
+        return 0, 0
     end
 
     local action, ret = fakefile.handle_open(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)

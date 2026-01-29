@@ -2,6 +2,11 @@
 
 目标：用 Docker 提供一致的运行环境，避免在宿主机安装运行期依赖；同时兼容本仓库的 Lua rules + AI（内置类 MCP）流程。
 
+镜像内默认包含：
+
+- `ip`（iproute2）：方便在容器里直接 `ip a` 查看网络信息
+- `curl`：用于验证 Web 服务是否可访问
+
 前提：qemu 二进制已在宿主机准备好（自己编译或拷贝现成的）。
 
 ## 1) 启动容器（镜像内包含 python3，可用于调用 API）
@@ -43,8 +48,8 @@ ROOTFS_DIR=/abs/path/to/rootfs ./docker/start.sh
 ## 3) AI 配置与规则产物位置
 
 - AI 的 key/baseurl/model 等放在：`rules_examples/config/env`（仓库已忽略该文件，避免误提交）。
-- AI 生成的临时规则与运行快照在：`rules_examples/data/ai_runs/<run_id>/`
-- 自动导出的“可直接复用的稳定规则”在：`rules_examples/data/stable_rules/<run_id>/`
+- AI 生成的临时规则与运行快照在：`rules_examples/cache/ai_runs/<run_id>/`
+- 自动导出的“可直接复用的稳定规则”在：`rules_examples/cache/stable_rules/<run_id>/`
 
 ## 4) docker-compose（可选）
 

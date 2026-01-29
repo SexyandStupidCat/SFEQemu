@@ -15509,6 +15509,145 @@ static int lua_mkdir_p(lua_State *L)
 }
 
 /*
+ * SFEmu：进程内 re-exec（用于“AI 修复后重新加载镜像/重新运行目标”）
+ *
+ * 背景：
+ * - 在 linux-user 模式下，目标进程调用 exit/exit_group 会导致整个 QEMU 进程退出；
+ * - 但 AI 干预往往是在“即将退出”的失败路径上产出修复规则（如补文件/改返回值），需要“重跑一次”才能验证；
+ * - 因此提供 c_request_reexec()，由 Lua 在需要时触发，让 QEMU 自己 exec 自己，重新启动并重新加载规则/镜像。
+ *
+ * 说明：
+ * - 默认通过环境变量限制重启次数，防止无限循环：
+ *   - SFEMU_REEXEC_COUNT：当前已重启次数（自动维护）
+ *   - SFEMU_REEXEC_MAX：最大允许次数（默认 3；设置为 0 表示禁用）
+ */
+void sfemu_reexec_init(int argc, char **argv);
+
+static char **sfemu_reexec_argv;
+static int sfemu_reexec_argc;
+static char *sfemu_reexec_self;
+static char *sfemu_reexec_tag;
+static int sfemu_reexec_requested;
+
+static int sfemu_env_int(const char *name, int defval)
+{
+    const char *v = getenv(name);
+    long out;
+    char *endp = NULL;
+
+    if (!v || !*v) {
+        return defval;
+    }
+    errno = 0;
+    out = strtol(v, &endp, 10);
+    if (errno != 0 || endp == v) {
+        return defval;
+    }
+    if (out < INT_MIN) {
+        return INT_MIN;
+    }
+    if (out > INT_MAX) {
+        return INT_MAX;
+    }
+    return (int)out;
+}
+
+void sfemu_reexec_init(int argc, char **argv)
+{
+    if (sfemu_reexec_argv) {
+        return;
+    }
+    if (argc <= 0 || !argv) {
+        return;
+    }
+
+    sfemu_reexec_argc = argc;
+    sfemu_reexec_argv = g_new0(char *, (size_t)argc + 1);
+    for (int i = 0; i < argc; i++) {
+        sfemu_reexec_argv[i] = g_strdup(argv[i] ? argv[i] : "");
+    }
+    sfemu_reexec_argv[argc] = NULL;
+
+    /* 尽量用 /proc/self/exe，避免 argv[0] 是相对路径时 execv 找不到 */
+    {
+        char buf[PATH_MAX];
+        ssize_t n = readlink("/proc/self/exe", buf, sizeof(buf) - 1);
+        if (n > 0) {
+            buf[n] = '\0';
+            sfemu_reexec_self = g_strdup(buf);
+        } else {
+            sfemu_reexec_self = g_strdup(argv[0] ? argv[0] : "");
+        }
+    }
+}
+
+static void sfemu_maybe_reexec(void)
+{
+    if (!sfemu_reexec_requested) {
+        return;
+    }
+
+    /* 只尝试一次：如果 exec 失败，避免每个 syscall 都刷屏 */
+    sfemu_reexec_requested = 0;
+
+    if (!sfemu_reexec_self || !sfemu_reexec_argv) {
+        fprintf(stderr, "[sfemu] reexec: 未初始化 argv/self，跳过\n");
+        return;
+    }
+
+    int max = sfemu_env_int("SFEMU_REEXEC_MAX", 3);
+    int cnt = sfemu_env_int("SFEMU_REEXEC_COUNT", 0);
+    if (max <= 0) {
+        fprintf(stderr, "[sfemu] reexec: SFEMU_REEXEC_MAX=%d 禁用，跳过\n", max);
+        return;
+    }
+    if (cnt >= max) {
+        fprintf(stderr, "[sfemu] reexec: 已达上限 SFEMU_REEXEC_COUNT=%d >= SFEMU_REEXEC_MAX=%d，跳过\n",
+                cnt, max);
+        return;
+    }
+
+    {
+        char buf[32];
+        snprintf(buf, sizeof(buf), "%d", cnt + 1);
+        setenv("SFEMU_REEXEC_COUNT", buf, 1);
+    }
+    if (sfemu_reexec_tag && *sfemu_reexec_tag) {
+        setenv("SFEMU_REEXEC_TAG", sfemu_reexec_tag, 1);
+    }
+
+    fprintf(stderr, "[sfemu] reexec: execv('%s') count=%d/%d tag=%s\n",
+            sfemu_reexec_self, cnt + 1, max, sfemu_reexec_tag ? sfemu_reexec_tag : "");
+    fflush(stderr);
+
+    execv(sfemu_reexec_self, sfemu_reexec_argv);
+
+    /* execv 失败才会到这里 */
+    fprintf(stderr, "[sfemu] reexec: execv 失败：%s\n", strerror(errno));
+    _exit(127);
+}
+
+/*
+ * Lua C 函数：请求 re-exec
+ * 用法：ok, rc = c_request_reexec([tag])
+ */
+static int lua_request_reexec(lua_State *L)
+{
+    const char *tag = luaL_optstring(L, 1, NULL);
+
+    g_free(sfemu_reexec_tag);
+    sfemu_reexec_tag = NULL;
+    if (tag && *tag) {
+        sfemu_reexec_tag = g_strdup(tag);
+    }
+    sfemu_reexec_requested = 1;
+
+    lua_pushboolean(L, true);
+    lua_pushinteger(L, 0);
+    return 2;
+}
+
+/*
  * Initialize Lua syscall integration
  * Called once during rules_init() to register C functions
  */
@@ -15548,6 +15687,7 @@ void init_lua_syscall_functions(lua_State *L)
         lua_register(L, "c_wait_user_continue", lua_wait_user_continue);
         lua_register(L, "c_watchdog_suspend", lua_watchdog_suspend);
         lua_register(L, "c_mkdir_p", lua_mkdir_p);
+        lua_register(L, "c_request_reexec", lua_request_reexec);
     }
 }
 
@@ -15948,6 +16088,9 @@ abi_long do_syscall(CPUArchState *cpu_env, int num, abi_long arg1,
     int lua_intercept = execute_lua_syscall_entry(cpu_env, syscall_name, num, &ret,
                                                   arg1, arg2, arg3, arg4,
                                                   arg5, arg6, arg7, arg8);
+
+    /* SFEmu：Lua 请求 re-exec（通常用于 exit/exit_group 的 AI 修复后重跑验证） */
+    sfemu_maybe_reexec();
 
     if (lua_intercept != 1) {
         ret = do_syscall1(cpu_env, num, arg1, arg2, arg3, arg4,

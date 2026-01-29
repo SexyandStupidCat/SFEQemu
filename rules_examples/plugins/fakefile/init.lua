@@ -49,6 +49,32 @@ local O_CREAT = 0x40
 local AF_UNIX = 1
 local SOCK_STREAM = 1
 
+-- 对少数“必须真实存在且内容正确”的关键文件，避免误创建 fakefile 占位导致程序早退。
+-- 典型：固件 httpd 在启动时会读取 /etc/cert.pem（证书），若被 fakefile 替换为元数据文件会触发 OpenSSL 错误。
+local function is_ssl_critical_path(path)
+    return path == "/etc/cert.pem"
+        or path == "/etc/key.pem"
+        or path == "/etc/server.pem"
+        or path == "/etc/cert.crt"
+end
+
+local bootstrap_checked = false
+local bootstrap_mod = nil
+
+local function get_bootstrap_mod()
+    if bootstrap_checked then
+        return bootstrap_mod
+    end
+    bootstrap_checked = true
+    local ok, mod = pcall(require, rules_dir .. "base/bootstrap_fs")
+    if ok and type(mod) == "table" then
+        bootstrap_mod = mod
+        return bootstrap_mod
+    end
+    bootstrap_mod = nil
+    return nil
+end
+
 -- ---------- 小工具：shell/路径/文件 ----------
 
 local function sh_quote(s)
@@ -74,7 +100,9 @@ local function ensure_dir(dir)
     if not dir or dir == "" then
         return false
     end
-    return sh_ok("mkdir -p -- " .. sh_quote(dir))
+    -- BusyBox 兼容：部分固件内置的 mkdir/test/ln 不支持 “--” 结束参数
+    -- 这里目录/路径均来自固件内绝对路径（通常以 / 开头），不依赖 -- 也足够安全。
+    return sh_ok("mkdir -p " .. sh_quote(dir))
 end
 
 local function dirname(path)
@@ -95,7 +123,8 @@ local function file_exists(path)
 end
 
 local function path_exists_any(path)
-    return sh_ok("test -e -- " .. sh_quote(path))
+    -- BusyBox test 可能不支持 “--”，会输出 “unknown operand”，导致误判不存在
+    return sh_ok("test -e " .. sh_quote(path))
 end
 
 local function write_file(path, data)
@@ -210,11 +239,11 @@ local function ensure_link(orig_path, fakefile_path)
 
     ensure_dir(dirname(orig_path))
     -- 硬链接：对“禁止软链/不跟随软链”的场景更友好
-    if sh_ok("ln -f -- " .. sh_quote(fakefile_path) .. " " .. sh_quote(orig_path)) then
+    if sh_ok("ln -f " .. sh_quote(fakefile_path) .. " " .. sh_quote(orig_path)) then
         return true
     end
     -- 软链接兜底
-    if sh_ok("ln -sf -- " .. sh_quote(fakefile_path) .. " " .. sh_quote(orig_path)) then
+    if sh_ok("ln -sf " .. sh_quote(fakefile_path) .. " " .. sh_quote(orig_path)) then
         return true
     end
     return false
@@ -595,7 +624,7 @@ local function ensure_socket_server(ctx, socket_path)
 
     ensure_dir(dirname(socket_path))
     -- 删除旧文件，避免 bind 失败（尽量用 shell，避免依赖 unlink syscall 号）
-    sh_ok("rm -f -- " .. sh_quote(socket_path))
+    sh_ok("rm -f " .. sh_quote(socket_path))
 
     local server_fd = c_do_syscall(sc.socket, AF_UNIX, SOCK_STREAM, 0, 0, 0, 0, 0, 0)
     if server_fd < 0 then
@@ -750,6 +779,17 @@ function M.handle_open(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)
         return 1, ret
     end
 
+    -- 对证书文件：缺失时优先尝试 bootstrap 补齐，避免被 fakefile 空文件/元数据占位导致 OpenSSL 退出
+    if is_ssl_critical_path(path) then
+        local b = get_bootstrap_mod()
+        if b and type(b.bootstrap) == "function" then
+            pcall(b.bootstrap)
+            local retry = c_do_syscall(num, pathname, flags, mode, arg4 or 0, arg5 or 0, arg6 or 0, arg7 or 0, arg8 or 0)
+            return 1, retry
+        end
+        return 1, ret
+    end
+
     -- 外部动态库必须真实存在：避免对 .so 创建 fakefile 干扰动态链接
     if is_shared_object_path(path) then
         return 1, ret
@@ -817,6 +857,17 @@ function M.handle_openat(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, ar
     end
 
     if ret ~= ENOENT or ((flags or 0) & O_CREAT) ~= 0 then
+        return 1, ret
+    end
+
+    -- 对证书文件：缺失时优先尝试 bootstrap 补齐，避免被 fakefile 空文件/元数据占位导致 OpenSSL 退出
+    if is_ssl_critical_path(path) then
+        local b = get_bootstrap_mod()
+        if b and type(b.bootstrap) == "function" then
+            pcall(b.bootstrap)
+            local retry = c_do_syscall(num, dirfd, pathname, flags, mode, arg5 or 0, arg6 or 0, arg7 or 0, arg8 or 0)
+            return 1, retry
+        end
         return 1, ret
     end
 

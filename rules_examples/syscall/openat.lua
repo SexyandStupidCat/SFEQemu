@@ -6,6 +6,46 @@ local rules_dir = script_dir:gsub("syscall/?$", "")
 local fakefile = require(rules_dir .. "plugins/fakefile")
 local fdmap = require(rules_dir .. "base/fdmap")
 
+local O_CREAT = 0x40
+local AT_FDCWD = -100
+
+local function dirname(path)
+    local p = tostring(path or "")
+    if p == "" then
+        return nil
+    end
+    if p ~= "/" then
+        p = p:gsub("/+$", "")
+    end
+    if p == "" or p == "/" then
+        return "/"
+    end
+    local d = p:match("^(.*)/[^/]+$") or ""
+    if d == "" then
+        if p:sub(1, 1) == "/" then
+            return "/"
+        end
+        return "."
+    end
+    return d
+end
+
+local function should_skip_dir(d)
+    if not d or d == "" or d == "." or d == "/" then
+        return true
+    end
+    if d == "/proc" or d:match("^/proc/") then
+        return true
+    end
+    if d == "/sys" or d:match("^/sys/") then
+        return true
+    end
+    if d == "/dev" or d:match("^/dev/") then
+        return true
+    end
+    return false
+end
+
 local function classify_path(path)
     if type(path) ~= "string" or path == "" then
         return "file"
@@ -36,6 +76,24 @@ function do_syscall(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, arg8)
         c_log(string.format("[openat] dirfd=%d %s flags=0x%x mode=0x%x", dirfd, path, flags, mode))
     else
         c_log(string.format("[openat] dirfd=%d pathname=0x%x flags=0x%x mode=0x%x", dirfd, pathname, flags, mode))
+    end
+
+    -- 带创建语义的 openat（O_CREAT）不做任何干预：直接走原始 syscall。
+    flags = math.floor(tonumber(flags) or 0)
+    if (flags & O_CREAT) ~= 0 then
+        -- openat(dirfd != AT_FDCWD, relative path) 无法可靠解析目标路径：跳过目录创建。
+        -- 仅在绝对路径或 dirfd==AT_FDCWD 时尝试创建父目录。
+        local can_handle = (type(path) == "string" and path ~= "" and (path:sub(1, 1) == "/" or dirfd == AT_FDCWD))
+        if can_handle and type(c_mkdir_p) == "function" then
+            local d = dirname(path)
+            if not should_skip_dir(d) then
+                local ok, rc = c_mkdir_p(d, 493) -- 0755
+                if not ok then
+                    c_log(string.format("[openat.creat] mkdir_p failed dir=%s rc=%s", tostring(d), tostring(rc)))
+                end
+            end
+        end
+        return 0, 0
     end
 
     local action, ret = fakefile.handle_openat(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, arg8)

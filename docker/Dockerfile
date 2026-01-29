@@ -6,6 +6,8 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
       bash \
       ca-certificates \
+      curl \
+      iproute2 \
       python3 \
       && rm -rf /var/lib/apt/lists/*
 

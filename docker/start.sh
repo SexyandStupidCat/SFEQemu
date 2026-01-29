@@ -125,15 +125,41 @@ exec docker run --rm -it \
 
     # 关键点：rootfs 的 /etc/resolv.conf 常见是 symlink -> /tmp/resolv.conf；
     # 而 chroot 脚本通常会把 /tmp 挂载成 tmpfs，导致 DNS 失效。
-    # 这里用 overlayfs 给 /rootfs/etc 做一个“临时可写覆盖层”，然后把容器的 resolv.conf 写进去，
-    # 从而避免修改宿主机 rootfs，同时保证 chroot 后 DNS 始终可用。
-    if [[ -d /rootfs/etc ]]; then
+    #
+    # 额外坑点：有些固件 rootfs 的 /etc 本身就是 symlink（常见 /etc -> /tmp/etc），并且“解包出来的 rootfs”
+    # 里可能还没有 /tmp/etc 这个目标目录。此时如果直接写 /rootfs/etc/resolv.conf，会因为 symlink 目标不存在而失败。
+    #
+    # 因此这里先解析“真实的 etc 目录”，确保其存在，再尝试 overlayfs 覆盖该目录，
+    # 最后把容器的 resolv.conf 写进去，保证 chroot 后 DNS 始终可用。
+    ROOTFS_ETC=/rootfs/etc
+    ETC_LINK=\"\"
+    if [[ -L /rootfs/etc ]]; then
+      ETC_LINK=\"\$(readlink /rootfs/etc 2>/dev/null || true)\"
+      if [[ -n \"\$ETC_LINK\" ]]; then
+        if [[ \"\$ETC_LINK\" == /* ]]; then
+          ROOTFS_ETC=\"/rootfs\${ETC_LINK}\"
+        else
+          ROOTFS_ETC=\"/rootfs/\${ETC_LINK}\"
+        fi
+        ROOTFS_ETC=\"\$(realpath -m \"\$ROOTFS_ETC\")\"
+      fi
+    fi
+
+    if [[ \"\$ROOTFS_ETC\" != \"/rootfs/etc\" ]]; then
+      echo \"[docker] rootfs /etc 为 symlink：/rootfs/etc -> \${ETC_LINK}\"
+      echo \"[docker] DNS 文件将注入到：\${ROOTFS_ETC}\"
+    fi
+
+    if [[ -e \"\$ROOTFS_ETC\" && ! -d \"\$ROOTFS_ETC\" ]]; then
+      echo \"[docker] WARN: rootfs etc 不是目录：\${ROOTFS_ETC}，跳过 overlayfs\"
+    else
+      mkdir -p \"\$ROOTFS_ETC\" >/dev/null 2>&1 || true
       overlay_upper=/tmp/sfemu_etc_upper
       overlay_work=/tmp/sfemu_etc_work
       mkdir -p \"\$overlay_upper\" \"\$overlay_work\"
-      if mount -t overlay overlay -o lowerdir=/rootfs/etc,upperdir=\"\$overlay_upper\",workdir=\"\$overlay_work\" /rootfs/etc 2>/dev/null; then
+      if mount -t overlay overlay -o \"lowerdir=\${ROOTFS_ETC},upperdir=\${overlay_upper},workdir=\${overlay_work}\" \"\$ROOTFS_ETC\" 2>/dev/null; then
         overlay_ok=1
-        mounted_targets+=(/rootfs/etc)
+        mounted_targets+=(\"\$ROOTFS_ETC\")
       else
         rm -rf -- \"\$overlay_upper\" \"\$overlay_work\" >/dev/null 2>&1 || true
         overlay_upper=\"\"
@@ -150,18 +176,18 @@ exec docker run --rm -it \
     bind_mount /etc/ssl/certs /rootfs/etc/ssl/certs
     # DNS/主机名解析：让 chroot 内的 python3 能正常解析域名
     if [[ \"\$overlay_ok\" == \"1\" ]]; then
-      cp -f /etc/resolv.conf /rootfs/etc/resolv.conf 2>/dev/null || true
-      cp -f /etc/nsswitch.conf /rootfs/etc/nsswitch.conf 2>/dev/null || true
-      cp -f /etc/hosts /rootfs/etc/hosts 2>/dev/null || true
+      cp -f /etc/resolv.conf \"\$ROOTFS_ETC/resolv.conf\" 2>/dev/null || true
+      cp -f /etc/nsswitch.conf \"\$ROOTFS_ETC/nsswitch.conf\" 2>/dev/null || true
+      cp -f /etc/hosts \"\$ROOTFS_ETC/hosts\" 2>/dev/null || true
     else
       # overlayfs 不可用时退化为 bind mount（可能受 /tmp tmpfs + symlink 影响）
-      bind_mount_file /etc/resolv.conf /rootfs/etc/resolv.conf
-      bind_mount_file /etc/nsswitch.conf /rootfs/etc/nsswitch.conf
-      bind_mount_file /etc/hosts /rootfs/etc/hosts
+      bind_mount_file /etc/resolv.conf \"\$ROOTFS_ETC/resolv.conf\"
+      bind_mount_file /etc/nsswitch.conf \"\$ROOTFS_ETC/nsswitch.conf\"
+      bind_mount_file /etc/hosts \"\$ROOTFS_ETC/hosts\"
     fi
 
     if [[ \"\$overlay_ok\" == \"1\" ]]; then
-      echo \"[docker] overlayfs 已启用：/rootfs/etc（chroot DNS 更稳）\"
+      echo \"[docker] overlayfs 已启用：\${ROOTFS_ETC}（chroot DNS 更稳）\"
     else
       echo \"[docker] overlayfs 未启用：使用 bind mount 注入 DNS 文件（若 rootfs 的 resolv.conf 是 /tmp symlink，可能仍受 /tmp tmpfs 影响）\"
     fi

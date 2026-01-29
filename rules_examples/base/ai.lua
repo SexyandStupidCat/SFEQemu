@@ -46,7 +46,8 @@ local function mkdir_p(path, mode)
     end
 
     -- 兼容：无 c_mkdir_p 时退化到 shell
-    local ok, _, code = os.execute("mkdir -p -- " .. sh_quote(path))
+    -- BusyBox 兼容：部分固件内置的 mkdir 不支持 “--” 结束参数
+    local ok, _, code = os.execute("mkdir -p " .. sh_quote(path))
     if ok == true or ok == 0 or code == 0 then
         return true, 0
     end
@@ -608,6 +609,15 @@ function M.handle(ctx, entry_state, meta)
         ai_cmd = rawget(_G, "SFEMU_AI_CMD"),
     }
 
+    -- auto_ai=1：在异常/死循环场景下无需人工确认，强制启用 AI 干预并自动继续运行
+    -- 说明：
+    -- - 入口侧(entry.lua)会在异常分支判断 need_ai；这里再兜底一次，避免用户仅设置 auto_ai 而忘记开启 SFEMU_AI_ENABLE。
+    local auto_ai = str_bool(rawget(_G, "auto_ai") or rawget(_G, "SFEMU_AUTO_AI"), false)
+    if auto_ai then
+        cfg.enable = true
+        cfg.auto_continue = true
+    end
+
     if not cfg.enable then
         return { auto_continue = false }
     end
@@ -622,15 +632,15 @@ function M.handle(ctx, entry_state, meta)
     -- 推导 rules 根目录（基于本文件位置）
     local script_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or ""
     local rules_dir = script_dir:gsub("base/?$", "")
-    local data_root = rules_dir .. "data"
+    local cache_root = rules_dir .. "cache"
     local run_id = now_run_id((type(ctx) == "table" and ctx.seq) or 0)
 
     local stable_root = cfg.stable_root
     if type(stable_root) ~= "string" or stable_root == "" then
-        stable_root = data_root .. "/stable_rules"
+        stable_root = cache_root .. "/stable_rules"
     end
 
-    local run_dir = string.format("%s/ai_runs/%s", data_root, run_id)
+    local run_dir = string.format("%s/ai_runs/%s", cache_root, run_id)
     local pseudo_dir = run_dir .. "/pseudocode"
     local mem_dir = run_dir .. "/memory"
     local patch_dir = run_dir .. "/rules_patch"
@@ -640,7 +650,7 @@ function M.handle(ctx, entry_state, meta)
     local patch_legacy_syscall_dir = patch_dir .. "/syscall"
 
     local ok = true
-    ok = ok and select(1, mkdir_p(data_root, 493))
+    ok = ok and select(1, mkdir_p(cache_root, 493))
     ok = ok and select(1, mkdir_p(stable_root, 493))
     ok = ok and select(1, mkdir_p(run_dir, 493))
     ok = ok and select(1, mkdir_p(pseudo_dir, 493))
@@ -818,7 +828,22 @@ function M.handle(ctx, entry_state, meta)
             end
             local script = rawget(_G, "SFEMU_AI_MCP_SCRIPT")
             if type(script) ~= "string" or script == "" then
-                script = rules_dir .. "tools/ai_mcp_openai.py"
+                local function file_exists(p)
+                    local f = io.open(p, "rb")
+                    if f then
+                        f:close()
+                        return true
+                    end
+                    return false
+                end
+
+                local preferred = rules_dir .. "plugins/ai/ai_mcp_openai.py"
+                local legacy = rules_dir .. "tools/ai_mcp_openai.py"
+                if file_exists(preferred) then
+                    script = preferred
+                else
+                    script = legacy
+                end
             end
             cfg.ai_cmd = tostring(py) .. " " .. sh_quote(script)
             append_file(retry_log_path, string.format("mcp_enable=1 mcp_py=%s mcp_script=%s\n", tostring(py), tostring(script)))
@@ -1092,7 +1117,9 @@ function M.handle(ctx, entry_state, meta)
             run_id = run_id,
             reason = meta.reason or "unknown",
             rules_dir = rules_dir,
-            data_root = data_root,
+            -- 兼容字段：历史上使用 data/，现改为 cache/（仍保留 data_root 以减少外部脚本改动）
+            cache_root = cache_root,
+            data_root = cache_root,
             stable_root = stable_root,
             start_seq = (type(ctx) == "table" and ctx.seq) or 0,
             verify_syscalls = cfg.verify_syscalls,

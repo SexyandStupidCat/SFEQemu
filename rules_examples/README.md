@@ -1,253 +1,173 @@
-# QEMU Lua Syscall Rules - 示例脚本
+# SFEmu Lua Rules（规则目录）使用说明 & API
 
-## 概述
+本目录是 **QEMU 用户态仿真（linux-user）** 的 Lua 规则入口：通过 `entry.lua/finish.lua` 在 syscall 前后介入，实现：
 
-此目录包含 QEMU 用户模式 Lua 系统调用拦截的示例脚本。规则目录以 `--rules <dir>` 指定，推荐结构如下：
+- 观测：记录 syscall、回溯、参数与返回值
+- 兼容：用 Lua 对缺失文件/设备/内核差异做最小补齐
+- 自动化修复：在异常退出/死循环/长时间无 syscall 时触发 AI 生成规则并自动应用
 
-```
-config/      # 配置（config/env 会被 entry.lua 自动加载）
-base/        # 通用基础模块（log、sftrace 等）
-data/        # 数据（预留）
-plugins/     # 插件目录
-  fakefile/  # fakefile 插件（含自身 config/data/default）
-syscall/     # 系统调用 hook（按 syscall 名命名，如 open.lua）
-entry.lua    # syscall 入口（每次 syscall 先进入这里）
-finish.lua   # syscall 结束（每次 syscall 结束进入这里）
-```
+---
 
-## 文件命名规范
+## 1. 快速开始
 
-- 文件名必须是系统调用名称，如：`read.lua`, `write.lua`, `open.lua`
-- QEMU 会根据系统调用名自动查找对应的 `.lua` 文件
+### 1.1 运行（示例）
 
-## 脚本格式
-
-每个 `syscall/<name>.lua` 脚本必须定义一个 `do_syscall` 函数：
-
-```lua
-function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-    -- 你的处理逻辑
-
-    -- 返回值：
-    -- action: 0 = 继续执行原系统调用, 1 = 已处理，使用返回值
-    -- return_value: 系统调用的返回值
-    return action, return_value
-end
-```
-
-### 参数说明
-
-- `num`: 系统调用号
-- `arg1` - `arg8`: 系统调用的参数（具体含义取决于系统调用）
-
-### 返回值
-
-函数必须返回两个值：
-
-1. **action** (整数):
-   - `0`: 继续执行原始系统调用
-   - `1`: 跳过原始系统调用，使用提供的返回值
-
-2. **return_value** (整数):
-   - 当 action = 1 时，这个值将作为系统调用的返回值
-
-## 可用的 C 辅助函数
-
-### c_log(message)
-输出日志消息
-
-```lua
-c_log("This is a log message")
-```
-
-### c_get_timestamp()
-获取当前时间戳，返回 (秒, 纳秒)
-
-```lua
-local sec, nsec = c_get_timestamp()
-c_log(string.format("Timestamp: %d.%09d", sec, nsec))
-```
-
-### c_read_string(addr)
-读取字符串（当前为占位符实现）
-
-```lua
-local str = c_read_string(pathname)
-```
-
-## 示例文件
-
-### write.lua
-监控 write 系统调用，记录大量写入，可选择性阻止过大的 stderr 写入。
-
-### read.lua
-监控 read 系统调用，特别关注从 stdin 的读取。
-
-### getpid.lua
-拦截 getpid 调用并返回假的 PID (99999)。
-
-### open.lua
-监控文件打开操作，可以基于路径名进行过滤（需要实现字符串读取）。
-
-### socket.lua
-监控 socket 创建，阻止创建原始套接字。
-
-### mmap.lua
-监控内存映射操作，记录大型映射和匿名映射。
-
-## 使用方法
-
-1. **创建规则目录**（建议直接复制本目录结构）：
-   ```bash
-   cp -r rules_examples my_rules
-   ```
-
-3. **运行 QEMU**：
-   ```bash
-   ./qemu-x86_64 --rules my_rules /path/to/binary
-   ```
-
-4. **观察输出**：
-   - 每次系统调用会先进入 `entry.lua`，由它在 `syscall/` 目录中按名称分发并执行 hook
-   - 系统调用完成后会进入 `finish.lua`（可记录返回值/执行结果）
-
-## 示例场景
-
-### 场景 1: 监控文件操作
-
-创建 `my_rules/open.lua`, `my_rules/read.lua`, `my_rules/write.lua`
+规则目录通过 QEMU 参数 `-rules <dir>` 指定。典型启动形态：
 
 ```bash
-./qemu-x86_64 --rules my_rules ./my_program
+./qemu-arm -L . \
+  -rules ./rules_examples/ \
+  -rules-ctx-keep 256 \
+  -rules-idle-ms 1000 \
+  -shadowstack log=off,summary=on,unwind_limit=100,max_stack=100 \
+  -sfanalysis ./out_httpd \
+  /usr/sbin/httpd
 ```
 
-### 场景 2: 返回假的系统信息
+### 1.2 验证（curl 地址）
 
-创建 `my_rules/getpid.lua`
-
-```lua
-function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-    return 1, 12345  -- 返回假 PID
-end
-```
-
-### 场景 3: 安全沙箱
-
-创建多个规则文件来限制程序行为：
-
-**socket.lua** - 阻止所有网络连接：
-```lua
-function do_syscall(num, domain, type, protocol, arg4, arg5, arg6, arg7, arg8)
-    c_log("Blocked socket creation")
-    return 1, -1  -- 返回错误
-end
-```
-
-**open.lua** - 限制文件访问（需要实现路径读取）：
-```lua
-function do_syscall(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)
-    -- 假设有 c_read_string 实现
-    -- local path = c_read_string(pathname)
-    -- if not path:match("^/tmp/") then
-    --     c_log("Blocked access to: " .. path)
-    --     return 1, -13  -- -EACCES
-    -- end
-    return 0, 0
-end
-```
-
-## 调试技巧
-
-### 1. 添加详细日志
-
-```lua
-function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
-    c_log(string.format("Called with: num=%d, arg1=%d, arg2=%d", num, arg1, arg2))
-    return 0, 0
-end
-```
-
-### 2. 检查脚本语法
+如果固件的 httpd 监听在本机回环（常见），在“运行 httpd 的同一环境”里验证：
 
 ```bash
-lua my_rules/write.lua
+curl -v http://127.0.0.1/
+curl -v http://127.0.0.1/index.asp
 ```
 
-### 3. 测试单个系统调用
+---
 
-只创建一个规则文件，测试特定系统调用的拦截。
+## 2. 目录结构（重构后）
 
-## 性能考虑
+```
+rules_examples/
+  entry.lua                  # syscall 入口：分发、缓存、死循环检测、触发 AI
+  finish.lua                 # syscall 结束：统一记录 ret/intercepted 等
 
-- **首次加载**: 第一次调用某个系统调用时会加载对应的 `.lua` 文件
-- **缓存**: 加载后的函数会被缓存，后续调用直接使用
-- **开销**: 每次系统调用都会检查是否有对应的 Lua 文件，但未加载的脚本只有文件存在性检查的开销
+  plugins/                   # 插件式工具
+    fakefile/                # fakefile：缺失文件/设备/socket 的“伪资源”补齐框架
+    ai/ai_mcp_openai.py      # 内置 AI 工具：读 snapshot -> 调 OpenAI 兼容 API -> 生成规则 patch
 
-## 扩展功能
+  syscall_override_user/     # 固件/型号相关的自定义规则（优先级最高）
+  syscall_override/          # AI/临时修复规则（运行时生成；优先级高于 syscall/）
+  syscall/                   # 默认 syscall 规则
 
-### 状态跟踪
+  base/                      # 通用基础库（可复用 API）
+  config/                    # 配置：config/env 会被 entry.lua 自动加载
+    env.example              # 可提交模板（真实密钥写到本地 config/env）
+    ssl/                     # 内置证书/密钥模板（供 bootstrap_fs 补齐 /etc/*.pem）
 
-你可以在脚本中使用全局变量来跟踪状态：
+  cache/                     # 运行时缓存/落盘输出（ctx、死循环报告、ai_runs、stable_rules）
+  log/                       # 日志（可选）
+```
+
+---
+
+## 3. syscall 规则 API
+
+### 3.1 规则文件命名
+
+- 默认规则放在：`syscall/<syscall_name>.lua`
+- 覆盖规则放在：`syscall_override_user/<syscall_name>.lua` 或 `syscall_override/<syscall_name>.lua`
+
+### 3.2 `do_syscall` 接口
+
+每个规则文件必须定义：
 
 ```lua
--- write.lua
-local write_count = 0
-local total_bytes = 0
-
-function do_syscall(num, fd, buf, count, arg4, arg5, arg6, arg7, arg8)
-    write_count = write_count + 1
-    total_bytes = total_bytes + count
-
-    if write_count % 100 == 0 then
-        c_log(string.format("Stats: %d writes, %d bytes total", write_count, total_bytes))
-    end
-
-    return 0, 0
+function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+  -- return action, ret
 end
 ```
 
-### 条件拦截
+返回值约定：
 
-根据参数值决定是否拦截：
+- `action = 0`：不拦截，继续执行真实 syscall
+- `action = 1`：拦截，直接返回 `ret`
+  - `ret >= 0`：成功返回值
+  - `ret < 0`：错误码（负 errno），例如 `-2` 表示 `-ENOENT`
 
-```lua
-function do_syscall(num, fd, buf, count, arg4, arg5, arg6, arg7, arg8)
-    -- 只拦截写入到特定 fd 的操作
-    if fd == 3 then
-        c_log("Intercepted write to fd 3")
-        return 1, count  -- 假装成功但不实际写入
-    end
-    return 0, 0
-end
+### 3.3 override 优先级
+
+`entry.lua` 内置的默认优先级：
+
+1) `syscall_override_user/<name>.lua`（固件自定义/人工快速迭代）  
+2) `syscall_override/<name>.lua`（AI/临时修复）  
+3) `syscall/<name>.lua`（基础规则）
+
+可通过 `SFEMU_RULES_OVERRIDE_DIR` 覆盖（用 `:` 分隔多个目录）。
+
+---
+
+## 4. 可用的 C 辅助函数（规则侧）
+
+下面列出规则中已经使用/依赖的函数（以实际代码为准）：
+
+- `c_log(msg)`：输出日志到 QEMU 侧
+- `c_do_syscall(num, ...)`：执行真实 syscall（避免 Lua 拦截递归）
+- `c_read_bytes(addr, n)` / `c_write_bytes(addr, data)`：读写 guest 内存字节（用于解析结构体/伪造回复）
+- `c_read_string(addr, max_len)`：读 guest C 字符串
+- `c_read_guest_bytes(addr, n)`：读 guest 字节（历史接口，部分规则仍会用）
+- `c_get_timestamp()`：返回 `(sec, nsec)`
+- `c_get_shadowstack()`：返回回溯地址表（需启用 `-shadowstack`）
+- `c_resolve_addr(addr, max_bytes)` / `c_resolve_host_addr(addr, max_bytes)`：地址解析（需启用 `-sfanalysis`）
+- `c_list_regs()` / `c_get_reg(name)`：寄存器访问（AI 快照采集用）
+- `c_async_probe_http(host, timeout_ms)`：异步探测目标服务（死循环前进性用）
+- `c_watchdog_suspend(on)`：暂停/恢复 watchdog（AI 干预期间避免误判）
+- `c_wait_user_continue(prompt)`：暂停等待人工确认继续（未开启自动继续时用）
+- `c_mkdir_p(path, mode)`：创建目录（`bootstrap_fs`/`entry.lua` 写 cache 用）
+
+---
+
+## 5. AI 干预（自动补全规则）
+
+### 5.1 触发条件
+
+当 `SFEMU_AI_ENABLE=1`（或 `auto_ai=1`）时，`entry.lua` 在以下场景会触发 `base/ai.lua`：
+
+- `exit/exit_group`（异常退出）
+- `deadloop`（syscall 重复序列检测到死循环）
+- `idle_deadloop`（长时间无 syscall，由 idle watchdog 触发）
+
+补充：
+
+- `auto_ai=1`：无人值守模式（不再提示“输入 YES 继续运行”，自动触发 AI 干预并自动继续）
+- `exit/exit_group` 场景下，如果 AI 已应用“修复型规则”且允许自动继续，为了完成“重试验证”，会触发 QEMU 自身 `re-exec` 重新运行目标（可用 `SFEMU_AI_REEXEC_ON_EXIT_FIX=0` 关闭；`SFEMU_REEXEC_MAX` 限制最大重启次数）。
+- 为了避免“等到 exit 才介入导致来不及修复”，默认还支持在关键 syscall 返回错误时触发 AI 干预，并在该 syscall 点尝试重试（例如 `open/openat/access/ioctl` 返回 `-ENOENT/-ENODEV/-ENOTTY` 等）：`SFEMU_AI_REPAIR_ON_ERROR=1`（可通过 `SFEMU_AI_REPAIR_SYSCALLS` / `SFEMU_AI_REPAIR_ERRNOS` 收敛范围）。
+
+### 5.2 外部工具接口（`SFEMU_AI_CMD`）
+
+当触发 AI 时，框架会执行：
+
+```bash
+$SFEMU_AI_CMD <snapshot.json> <rules_patch_dir> <env_path>
 ```
 
-## 注意事项
+外部工具需要输出：
 
-1. 函数名必须是 `do_syscall`，不能是其他名字
-2. 文件名必须与系统调用名完全匹配
-3. 每个文件只能包含一个系统调用的处理逻辑
-4. 脚本错误不会导致 QEMU 崩溃，而是输出错误并继续执行原系统调用
-5. 多个脚本之间是独立的，不共享全局变量（除非使用 Lua 的模块机制）
+- 修复型规则：`<rules_patch_dir>/fix/syscall/<name>.lua`
+- 观测型规则：`<rules_patch_dir>/observe/syscall/<name>.lua`
 
-## 常见问题
+随后 `base/ai.lua` 会把修复规则默认落到 `syscall_override/`（不覆盖基础 `syscall/`），并进入验证窗口，稳定后导出到 `cache/stable_rules/<run_id>/`。
 
-### Q: 如何知道某个系统调用的参数含义？
-A: 使用 `man 2 <syscall_name>` 查看系统调用手册。
+### 5.3 内置 AI 工具（OpenAI 兼容）
 
-### Q: 为什么我的脚本没有被加载？
-A: 检查：
-- 文件名是否与系统调用名完全匹配
-- 文件是否有 `.lua` 扩展名
-- 系统调用名是否在 `get_syscall_name()` 中有映射
+当满足以下条件时，无需手写脚本：
 
-### Q: 如何添加对新系统调用的支持？
-A: 在 `linux-user/syscall.c` 的 `get_syscall_name()` 函数中添加对应的 case 分支。
+- `SFEMU_AI_MCP_ENABLE=1`
+- 未显式设置 `SFEMU_AI_CMD`
 
-### Q: 脚本中的错误会导致程序崩溃吗？
-A: 不会。脚本错误会被捕获并输出，然后继续执行原系统调用。
+框架会自动调用：`plugins/ai/ai_mcp_openai.py`  
+它会读取 `config/env`（或 `SFEMU_AI_ENV` 指定的 env 文件）中的 `OPENAI_*` 参数。
 
-## 参考资源
+建议流程：
 
-- Linux 系统调用: `man 2 syscalls`
-- Lua 手册: https://www.lua.org/manual/5.3/
-- QEMU 文档: https://www.qemu.org/docs/master/
+1) `cp config/env.example config/env`
+2) 填写 `OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL`
+3) 设置 `SFEMU_AI_ENABLE=1`、`SFEMU_AI_MCP_ENABLE=1`、`SFEMU_AI_AUTO_CONTINUE=1`
+
+---
+
+## 6. 固件相关的关键规则（示例）
+
+- WLCSM/NVRAM（避免 `nvram_get()` 返回 NULL）：`syscall_override_user/sendmsg.lua` + `syscall_override_user/recvmsg.lua`
+- 私有 netlink proto=31 前进性兜底：`syscall_override_user/socket.lua`（配合 `SFEMU_NETLINK_VIRTUAL_ACK`）
+- SSL/目录补齐（避免 httpd 因证书/目录缺失退出）：`base/bootstrap_fs.lua`（使用 `config/ssl/` 里的模板）

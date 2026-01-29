@@ -11,6 +11,7 @@ ai_mcp_openai.py - 内置“类 MCP”能力：读取快照 -> 调用 OpenAI 兼
   - 观测型规则：<rules_patch_dir>/observe/syscall/<name>.lua
 
 说明：
+  - 本脚本作为 rules/plugins/ 下的插件式工具使用。
   - 本脚本只负责“生成规则文件”；是否应用/验证/导出 stable_rules 由 base/ai.lua 负责。
   - env 文件中读取：OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
 """
@@ -29,6 +30,28 @@ from typing import Dict, Any, Tuple, Optional
 
 def eprint(*args: object) -> None:
     print(*args, file=sys.stderr)
+
+def str_bool(v: Optional[str], default: bool) -> bool:
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return default
+
+
+def clamp_int(v: Optional[str], lo: int, hi: int, default: int) -> int:
+    try:
+        n = int(str(v).strip())
+    except Exception:
+        return default
+    if n < lo:
+        return lo
+    if n > hi:
+        return hi
+    return n
 
 
 def load_env(env_path: str) -> Dict[str, str]:
@@ -94,7 +117,7 @@ def hexdump(data: bytes, max_bytes: int = 256) -> str:
     return "\n".join(out)
 
 
-def build_prompt(snapshot: Dict[str, Any], run_dir: str) -> Tuple[str, str]:
+def build_prompt(snapshot: Dict[str, Any], run_dir: str, env: Dict[str, str]) -> Tuple[str, str]:
     """
     返回 (system_prompt, user_prompt)
     """
@@ -128,6 +151,7 @@ def build_prompt(snapshot: Dict[str, Any], run_dir: str) -> Tuple[str, str]:
 
     system_prompt = (
         "你是一个资深的二进制仿真/系统调用兼容性工程师。\n"
+        "推理强度（Reasoning effort）：Extra high。\n"
         "我会给你一份仿真失败时的上下文快照（寄存器、调用栈、近期 syscall 序列、内存证据）。\n"
         "你的任务是：生成最小、可回滚、尽量精确命中的 Lua syscall 规则，用于修复仿真失败并让固件继续运行。\n"
         "\n"
@@ -179,6 +203,104 @@ def build_prompt(snapshot: Dict[str, Any], run_dir: str) -> Tuple[str, str]:
         user_prompt += "\n## 内存证据（二进制 hexdump，最多 256B/项）\n"
         for item in mem_blobs[:16]:
             user_prompt += f"\n### {item['file']}\n{item['hexdump']}\n"
+
+    # 可选：把调用栈对应的伪 C 一并放入 prompt（默认开启，但会严格截断避免 prompt 过大）
+    include_pseudo = str_bool(env.get("SFEMU_AI_MCP_INCLUDE_PSEUDOCODE") or env.get("SFEMU_AI_MCP_PSEUDOCODE"), True)
+    pseudo_max_frames = clamp_int(env.get("SFEMU_AI_MCP_PSEUDOCODE_FRAMES"), 0, 256, 4)
+    pseudo_max_total = clamp_int(env.get("SFEMU_AI_MCP_PSEUDOCODE_MAX_BYTES"), 0, 1 << 20, 32 * 1024)
+    pseudo_max_file = clamp_int(env.get("SFEMU_AI_MCP_PSEUDOCODE_FILE_BYTES"), 0, 1 << 20, 8 * 1024)
+
+    if include_pseudo and pseudo_max_frames > 0 and pseudo_max_total > 0 and pseudo_max_file > 0:
+        bt = snapshot.get("backtrace") or {}
+        pseudo_index = (bt.get("pseudocode_index") if isinstance(bt, dict) else None) or []
+        frames = (bt.get("frames") if isinstance(bt, dict) else None) or []
+
+        frame_map: Dict[int, Dict[str, Any]] = {}
+        if isinstance(frames, list):
+            for f in frames:
+                if not isinstance(f, dict):
+                    continue
+                idx = f.get("idx")
+                if isinstance(idx, int):
+                    frame_map[idx] = f
+
+        def utf8_len(s: str) -> int:
+            return len((s or "").encode("utf-8", errors="replace"))
+
+        def resolve_pseudocode_path(p: str) -> str:
+            # 1) 原样（绝对路径或相对路径，按当前 cwd 解析）
+            cand = os.path.abspath(p)
+            if os.path.isfile(cand):
+                return cand
+            # 2) 兜底：只用 basename，强制从 run_dir/pseudocode 取
+            cand2 = os.path.abspath(os.path.join(run_dir, "pseudocode", os.path.basename(p)))
+            if os.path.isfile(cand2):
+                return cand2
+            return ""
+
+        picked = []
+        total_bytes = 0
+        if isinstance(pseudo_index, list):
+            for it in pseudo_index:
+                if len(picked) >= pseudo_max_frames:
+                    break
+                if total_bytes >= pseudo_max_total:
+                    break
+                if not isinstance(it, dict):
+                    continue
+                fno = it.get("frame")
+                addr_hex = it.get("addr_hex")
+                p = it.get("file")
+                if not isinstance(p, str) or not p.strip():
+                    continue
+                abs_p = resolve_pseudocode_path(p)
+                if not abs_p:
+                    continue
+                text = read_text_if_exists(abs_p, pseudo_max_file)
+                if not text.strip():
+                    continue
+
+                # 总量截断：避免 prompt 过大
+                remain = pseudo_max_total - total_bytes
+                mcp_truncated = False
+                if remain <= 0:
+                    break
+                if utf8_len(text) > remain:
+                    raw = text.encode("utf-8", errors="replace")[:remain]
+                    text = raw.decode("utf-8", errors="replace")
+                    mcp_truncated = True
+
+                total_bytes += utf8_len(text)
+
+                head = []
+                head.append(f"frame={fno} addr={addr_hex}")
+                fi = frame_map.get(fno) if isinstance(fno, int) else None
+                if fi:
+                    mn = fi.get("module_name")
+                    fn = fi.get("func_name")
+                    if mn or fn:
+                        head.append(f"{mn}::{fn}")
+                    pcf = fi.get("pseudocode_file")
+                    if pcf:
+                        head.append(f"pseudo_c_file={pcf}")
+
+                note = []
+                if it.get("truncated") is True:
+                    note.append("sfanalysis_truncated=1")
+                if mcp_truncated:
+                    note.append("mcp_truncated=1")
+
+                header = " ".join(str(x) for x in head if x is not None and str(x) != "")
+                if note:
+                    header += " [" + ", ".join(note) + "]"
+
+                picked.append((header, text))
+
+        if picked:
+            user_prompt += "\n\n## 伪C（调用栈对应，节选）\n"
+            user_prompt += f"(max_frames={pseudo_max_frames} max_total_bytes={pseudo_max_total} max_file_bytes={pseudo_max_file})\n"
+            for header, text in picked:
+                user_prompt += f"\n### {header}\n{text}\n"
 
     return system_prompt, user_prompt
 
@@ -841,7 +963,7 @@ def main(argv: list[str]) -> int:
         eprint(f"[ai_mcp_openai] 读取 snapshot 失败: {ex}")
         return 3
 
-    system_prompt, user_prompt = build_prompt(snapshot, run_dir)
+    system_prompt, user_prompt = build_prompt(snapshot, run_dir, env)
 
     try:
         content = call_openai_chat(env, system_prompt, user_prompt)

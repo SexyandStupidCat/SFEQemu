@@ -103,6 +103,8 @@ static char lua_log_path[PATH_MAX];
 
 /* External function from syscall.c to initialize Lua syscall functions */
 void init_lua_syscall_functions(lua_State *L);
+/* SFEmu: 保存 argv/self 路径，供 syscall.c 在需要时 re-exec 重新加载镜像/规则 */
+void sfemu_reexec_init(int argc, char **argv);
 
 /*
  * Used to implement backwards-compatibility for the `-strace`, and
@@ -929,6 +931,7 @@ int main(int argc, char **argv, char **envp)
     bool preserve_argv0;
 
     error_init(argv[0]);
+    sfemu_reexec_init(argc, argv);
     module_call_init(MODULE_INIT_TRACE);
     qemu_init_cpu_list();
     module_call_init(MODULE_INIT_QOM);

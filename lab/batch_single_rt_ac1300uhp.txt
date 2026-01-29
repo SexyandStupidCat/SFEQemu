@@ -1,0 +1,4 @@
+# batch_single_rt_ac1300uhp.txt
+# 单固件快速跑通用：FW_RT_AC1300UHP_30043808375
+
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1300UHP_30043808375/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1300UHP_30043808375/rootfs

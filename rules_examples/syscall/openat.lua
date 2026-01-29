@@ -65,8 +65,10 @@ end
 function do_syscall(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, arg8)
     -- 先执行 openat 自己的逻辑（日志/统计），再交给 fakefile 做缺失资源补全
     local path = ""
+    local path_rc = -1
     if pathname ~= 0 then
         local p, rc = c_read_string(pathname, 4096)
+        path_rc = tonumber(rc) or -1
         if rc == 0 and p and p ~= "" then
             path = p
         end
@@ -76,6 +78,13 @@ function do_syscall(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, arg8)
         c_log(string.format("[openat] dirfd=%d %s flags=0x%x mode=0x%x", dirfd, path, flags, mode))
     else
         c_log(string.format("[openat] dirfd=%d pathname=0x%x flags=0x%x mode=0x%x", dirfd, pathname, flags, mode))
+    end
+
+    -- 额外输出一条更便于 grep/解析的目标路径日志
+    if path ~= "" then
+        c_log(string.format("[openat.target] %s", path))
+    else
+        c_log(string.format("[openat.target] (unreadable pathname=0x%x rc=%d)", pathname, path_rc))
     end
 
     -- 带创建语义的 openat（O_CREAT）不做任何干预：直接走原始 syscall。

@@ -151,6 +151,8 @@ local SYSCALL_NUM_TO_NAME = {
     [292] = "recvfrom",
     [296] = "sendmsg",
     [297] = "recvmsg",
+    -- ARM EABI: mmap2=192（大量动态链接/库加载会用到；/dev/nvram 也依赖 mmap2）
+    [192] = "mmap2",
 }
 
 -- cache/：用于落盘 syscall 上下文、死循环报告、AI 快照与稳定规则等
@@ -912,6 +914,7 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
     -- 清理上一条 syscall 的上下文，避免 finish.lua 误用旧数据
     _G._sfemu_syscall_ctx = nil
 
+    local generated_unknown = false
     if type(syscall_name) ~= "string" or syscall_name == "" then
         local mapped = nil
         if type(num) == "number" then
@@ -920,7 +923,14 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
         if type(mapped) == "string" and mapped ~= "" then
             syscall_name = mapped
         else
-            return false, 0
+            -- 默认：未映射 syscall 直接跳过（性能更好，避免刷屏）。
+            -- 但在排障/批量实验中，常见“进程卡住但日志不再前进”的情况其实是进入了未映射 syscall（例如 futex/epoll/nanosleep 等）。
+            -- 此时可设置：SFEMU_LOG_UNKNOWN_SYSCALLS=1，让 entry/finish 也记录这些 syscall（使用 sys_<num> 作为展示名）。
+            if not str_bool(rawget(_G, "SFEMU_LOG_UNKNOWN_SYSCALLS"), false) then
+                return false, 0
+            end
+            syscall_name = string.format("sys_%d", tonumber(num) or 0)
+            generated_unknown = true
         end
     end
 
@@ -999,6 +1009,11 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
                 pcall(ai.on_syscall, _G._sfemu_syscall_ctx, state)
             end
         end
+    end
+
+    -- 对未映射 syscall：仅做观测与死循环检测，不做规则加载/AI 修复（避免大量 I/O 与误伤）。
+    if generated_unknown then
+        return false, 0
     end
 
     local env = load_handler_env(syscall_name)

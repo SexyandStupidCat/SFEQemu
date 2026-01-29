@@ -186,16 +186,39 @@ function M.bootstrap()
         return false, "not_in_firmware_rootfs"
     end
 
-    -- A) 目录补齐：/var/lock（httpd file_lock 依赖）
+    -- A) 目录补齐（尽量兼容 /etc -> /tmp/etc 与 /var -> /tmp/var 的固件布局）
+    --
+    -- 重要坑点：
+    -- - 很多固件把 /var 做成 symlink（/var -> /tmp/var），但解包后的 /tmp/var 可能不存在；
+    -- - 此时在宿主侧直接 mkdir -p /var/run 会失败（因为 /var 作为 symlink 已存在，但目标目录不存在），表现为 errno=EEXIST/ENOENT；
+    -- - 因此这里优先补齐 /tmp/var，再补齐 /var/run /var/lock。
+
+    -- A1) /tmp/etc（兼容 /etc -> /tmp/etc；若 /tmp 被挂 tmpfs，此目录常为空）
     do
-        local lock_dir = join_root(root, "/var/lock")
-        local ok, err = ensure_dir(lock_dir)
+        local tmp_etc_dir = join_root(root, "/tmp/etc")
+        local ok, err = ensure_dir(tmp_etc_dir)
         if not ok then
-            log("创建目录失败：%s err=%s", lock_dir, tostring(err))
+            log("创建目录失败：%s err=%s", tmp_etc_dir, tostring(err))
         end
     end
 
-    -- A2) 目录补齐：/var/run（httpd 写 pidfile 常用路径）
+    -- A2) /tmp/var/{run,lock}（为 /var -> /tmp/var 兜底）
+    do
+        local tmp_var_run = join_root(root, "/tmp/var/run")
+        local ok, err = ensure_dir(tmp_var_run)
+        if not ok then
+            log("创建目录失败：%s err=%s", tmp_var_run, tostring(err))
+        end
+    end
+    do
+        local tmp_var_lock = join_root(root, "/tmp/var/lock")
+        local ok, err = ensure_dir(tmp_var_lock)
+        if not ok then
+            log("创建目录失败：%s err=%s", tmp_var_lock, tostring(err))
+        end
+    end
+
+    -- A3) /var/run（httpd 写 pidfile 常用路径）
     do
         local run_dir = join_root(root, "/var/run")
         local ok, err = ensure_dir(run_dir)
@@ -204,12 +227,12 @@ function M.bootstrap()
         end
     end
 
-    -- A3) 目录补齐：/tmp/etc（兼容 /etc -> /tmp/etc；若 /tmp 被挂 tmpfs，此目录常为空）
+    -- A4) /var/lock（httpd file_lock 依赖）
     do
-        local tmp_etc_dir = join_root(root, "/tmp/etc")
-        local ok, err = ensure_dir(tmp_etc_dir)
+        local lock_dir = join_root(root, "/var/lock")
+        local ok, err = ensure_dir(lock_dir)
         if not ok then
-            log("创建目录失败：%s err=%s", tmp_etc_dir, tostring(err))
+            log("创建目录失败：%s err=%s", lock_dir, tostring(err))
         end
     end
 

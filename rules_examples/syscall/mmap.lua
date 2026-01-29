@@ -1,7 +1,17 @@
 -- mmap.lua - Hook for mmap syscall
 -- This script monitors memory mapping operations
 
+local script_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or ""
+local rules_dir = script_dir:gsub("syscall/?$", "")
+local nvram = require(rules_dir .. "base/nvram")
+
 function do_syscall(num, addr, length, prot, flags, fd, offset, arg7, arg8)
+    -- /dev/nvram：优先兼容（nvram_init 需要 mmap 成功）
+    local action, retval = nvram.handle_mmap(num, addr, length, prot, flags, fd, offset, arg7, arg8)
+    if action == 1 then
+        return action, retval
+    end
+
     local sec, nsec = c_get_timestamp()
 
     -- Log large memory mappings

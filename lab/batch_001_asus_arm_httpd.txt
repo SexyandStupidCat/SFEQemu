@@ -1,0 +1,18 @@
+# batch_001_asus_arm_httpd.txt
+# 格式：<httpd_abs_path><空格><rootfs_dir>
+#
+# 说明：
+# - 该批次从 /media/user/ddisk/Work/FirmAE/firmwares/dataset/httpd_abs_paths.txt 中筛选：
+#   仅保留 ELF ARM 的 /usr/sbin/httpd（优先 ASUS 系列），用于首轮跑通流程与总结通用规则。
+
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_BRT_AC828_30043807526/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_BRT_AC828_30043807526/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200G_300438250624/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200G_300438250624/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200GPlus_300438250624/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200GPlus_300438250624/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1300GPLUS_30043808375/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1300GPLUS_30043808375/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1300UHP_30043808375/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1300UHP_30043808375/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1750_B1_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1750_B1_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900P_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900P_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900U_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900U_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC3100_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC3100_300438432738/rootfs
+

@@ -73,3 +73,40 @@
   - 结果：`/QIS_wizard.htm`、`/images/favicon.png`、`/qis/qis_style.css` 均恢复 200。
 
 （每个固件的结果将记录：启动命令、curl 结果、关键错误点、是否新增“通用规则/固件特定规则”。）
+
+#### 复测：FW_RT_AC1300UHP_30043808375（确认 Web UI 不再 404）
+
+- 时间：2026-01-30
+- 执行：
+  - 通过脚本重新仿真并验证：`./lab/run_batch_001.sh lab/batch_single_rt_ac1300uhp.txt`
+  - 额外手工验证关键页面/资源（在容器内 curl）：
+    - `/` → 200（JS 重定向到 `/QIS_wizard.htm?flag=welcome`）
+    - `/QIS_wizard.htm` → 200
+    - `/Main_Login.asp` → 200
+    - `/images/favicon.png` → 200
+- 结果：
+  - 监听：`0.0.0.0:80`（`ss -lntp` 可见 `qemu-arm` 监听）
+  - 说明：该问题确认是“cwd/webroot”导致的假 404，`start.sh` 的 webroot 选择逻辑生效。
+
+#### 新发现：宿主机访问端口映射后连接被重置/仿真进程崩溃
+
+- 时间：2026-01-30
+- 复现方式：
+  - 使用 `DOCKER_PUBLISH=1` 把容器内的 80 映射到宿主机端口（例如 `18081:80`）
+  - 宿主机 `curl http://127.0.0.1:18081/` 或浏览器访问 `/QIS_wizard.htm?...`
+- 现象：
+  - 容器内 `curl http://127.0.0.1:80/` 可成功（批量脚本判定为 success）
+  - 但宿主机访问映射端口时常出现 `Connection reset by peer`，随后 `qemu-arm` 退出并生成 core（`qemu: uncaught target signal 11`）
+- 根因定位：
+  - privileged Docker 容器内自带真实字符设备 `/dev/nvram`（major=10 minor=144）
+  - 固件 `httpd` 在处理请求时打开 `/dev/nvram`，但该设备在容器环境里 `open()` 返回 `-EBUSY/-EINVAL`
+  - 触发固件异常路径并最终崩溃（表现为宿主机连接被重置、qemu/core dump）
+- 修复：
+  - QEMU 侧新增 Lua helper：`c_open_host()`（仅允许打开 `/dev/zero|/dev/null|/dev/urandom|/dev/random`）
+  - 规则侧：`open/openat` 对 `/dev/nvram` 强制用 `c_open_host("/dev/zero", flags, mode)` 获取“安全 fd”，并在 `fdmap` 中标记为 `/dev/nvram`
+  - 后续 `ioctl/mmap/read/write` 由 `rules_examples/base/nvram.lua` 接管，保证 nvram_get/nvram_set 前进性
+  - 重新编译并同步 `qemu-arm`：`build-user-static/qemu-arm` → `/media/user/ddisk/Work/Project/SFEmu/workspace/rootfs/qemu-arm`
+- 复测结果：
+  - 宿主机访问 `http://127.0.0.1:18081/` 与 `http://127.0.0.1:18081/QIS_wizard.htm?flag=welcome` 均返回 200
+  - 静态资源 `/images/favicon.png`、`/qis/qis_style.css` 也返回 200
+  - 容器保持运行，未再出现访问即退出的情况

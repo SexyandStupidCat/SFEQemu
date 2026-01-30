@@ -114,6 +114,7 @@ end
 - `c_watchdog_suspend(on)`：暂停/恢复 watchdog（AI 干预期间避免误判）
 - `c_wait_user_continue(prompt)`：暂停等待人工确认继续（未开启自动继续时用）
 - `c_mkdir_p(path, mode)`：创建目录（`bootstrap_fs`/`entry.lua` 写 cache 用）
+- `c_open_host(path, flags[, mode])`：宿主侧打开“安全白名单”设备文件（用于把 `/dev/zero` 映射成 `/dev/nvram` 等场景）
 
 ---
 

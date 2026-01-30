@@ -24,9 +24,18 @@
 
 ### 1.3 NVRAM 设备缺失（/dev/nvram）
 
-- 现象：`/dev/nvram` 打开/`ioctl` 返回 `EINVAL/ENOTTY`，导致配置读取失败。
-- 策略：使用 fakefile + ioctl 兼容（按需扩展具体 ioctl 编号与结构体）。
-- 文件：`rules_examples/plugins/fakefile/init.lua`、`rules_examples/syscall/ioctl.lua`（以及固件侧 override 如需要）
+- 现象：
+  - 典型：`/dev/nvram` 不存在，或 `ioctl` 返回 `EINVAL/ENOTTY`，导致配置读取失败
+  - 特殊但高频（privileged docker）：容器内可能自带真实字符设备 `/dev/nvram`，但 `open()` 返回 `-EBUSY/-EINVAL`；
+    在 ASUS `httpd/2.0` 这类固件里，往往会在处理“非 loopback 来访”路径上触发该分支并崩溃/退出（表现为宿主机访问端口后连接被重置、qemu/core dump）
+- 策略：
+  - 规则侧：`open/openat` 对 `/dev/nvram` 统一“重定向打开 `/dev/zero`”，并在 `fdmap` 里把该 fd 标记成 `/dev/nvram`
+  - 行为侧：后续 `ioctl/mmap/read/write` 由 `rules_examples/base/nvram.lua` 接管，提供最小可用的 nvram_get/nvram_set 前进性
+  - 引擎侧：新增 Lua helper `c_open_host()`（只允许打开 `/dev/zero|/dev/null|/dev/urandom|/dev/random`），避免 Lua 改写只读 rodata 中的 pathname 指针失败
+- 文件：
+  - 规则：`rules_examples/syscall/open.lua`、`rules_examples/syscall/openat.lua`、`rules_examples/syscall/ioctl.lua`、`rules_examples/syscall/mmap.lua`、`rules_examples/syscall/mmap2.lua`
+  - 逻辑：`rules_examples/base/nvram.lua`、`rules_examples/base/fdmap.lua`
+  - 引擎：`linux-user/syscall.c`（`c_open_host` + `get_syscall_name` 补齐 `execveat`）
 
 ### 1.4 /dev/log 缺失（syslog socket）
 
@@ -67,6 +76,14 @@
   如果我们在 `/` 启动它，而真正的 webroot 在 `/www`，就会出现“根路径能返回但所有文件 404”的假成功。
 - 策略：启动时把 cwd 切到 webroot（优先 `/www`），同时用绝对路径运行 `qemu-arm` 并保持 `-L` 指向固件根。
   - 批量脚本已内置：`lab/run_batch_001.sh` 会在生成的 `start.sh` 里自动选择 webroot（也可用 `SFEMU_WEBROOT` 覆盖）。
+
+### 1.9 exec 系列 syscall 观测（仅打印命令行）
+
+- 目标：排障时快速看到固件在 `execve/execveat` 里到底拉起了哪些脚本/辅助程序（例如 `gencert.sh`、`openssl`、`rc` 等），不改变行为。
+- 文件：
+  - `rules_examples/syscall/execve.lua`
+  - `rules_examples/syscall/execveat.lua`
+  - 规则行为：仅打印 `[execve] ...` / `[execveat] ...`，随后 `return 0,0` 放行原始 syscall。
 
 ## 2. 规则收敛方法（每 10 个固件执行一次）
 

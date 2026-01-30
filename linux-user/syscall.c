@@ -15509,6 +15509,55 @@ static int lua_mkdir_p(lua_State *L)
 }
 
 /*
+ * Lua C 函数：在宿主侧打开“安全白名单”路径
+ *
+ * 背景：
+ * - 固件常见会打开 /dev/nvram，但在 privileged docker 里 /dev/nvram 可能是真实字符设备，
+ *   其 open() 往往返回 -EBUSY/-EINVAL，进而导致固件在处理请求时崩溃/退出。
+ * - Lua 侧无法可靠修改只读 rodata 中的路径字符串来重定向 open（c_write_bytes 可能失败）。
+ *
+ * 因此提供一个极小的“白名单 host open”能力：仅允许打开少数安全设备文件，
+ * 由 Lua 规则决定把 fd 映射为目标设备（例如把 /dev/zero 的 fd 伪装成 /dev/nvram）。
+ *
+ * 用法：
+ *   ret = c_open_host("/dev/zero", flags[, mode])
+ * 返回：
+ *   ret >= 0 : 打开成功，返回 fd
+ *   ret < 0  : 失败，返回 -TARGET_errno
+ */
+static int lua_open_host(lua_State *L)
+{
+    const char *path = luaL_checkstring(L, 1);
+    lua_Integer flags_arg = luaL_checkinteger(L, 2);
+    lua_Integer mode_arg = luaL_optinteger(L, 3, 0644);
+
+    if (!path || !*path) {
+        lua_pushinteger(L, -TARGET_EINVAL);
+        return 1;
+    }
+
+    /* 白名单：仅允许打开“无副作用”的设备文件 */
+    if (strcmp(path, "/dev/zero") != 0 &&
+        strcmp(path, "/dev/null") != 0 &&
+        strcmp(path, "/dev/urandom") != 0 &&
+        strcmp(path, "/dev/random") != 0) {
+        lua_pushinteger(L, -TARGET_EACCES);
+        return 1;
+    }
+
+    int flags = (int)flags_arg;
+    int mode = (int)mode_arg & 0777;
+
+    int fd = open(path, flags, mode);
+    if (fd < 0) {
+        lua_pushinteger(L, -host_to_target_errno(errno));
+        return 1;
+    }
+    lua_pushinteger(L, fd);
+    return 1;
+}
+
+/*
  * SFEmu：进程内 re-exec（用于“AI 修复后重新加载镜像/重新运行目标”）
  *
  * 背景：
@@ -15687,6 +15736,7 @@ void init_lua_syscall_functions(lua_State *L)
         lua_register(L, "c_wait_user_continue", lua_wait_user_continue);
         lua_register(L, "c_watchdog_suspend", lua_watchdog_suspend);
         lua_register(L, "c_mkdir_p", lua_mkdir_p);
+        lua_register(L, "c_open_host", lua_open_host);
         lua_register(L, "c_request_reexec", lua_request_reexec);
     }
 }
@@ -15750,6 +15800,9 @@ static const char *get_syscall_name(int num)
 #endif
 #ifdef TARGET_NR_execve
         case TARGET_NR_execve: return "execve";
+#endif
+#ifdef TARGET_NR_execveat
+        case TARGET_NR_execveat: return "execveat";
 #endif
 #ifdef TARGET_NR_exit
         case TARGET_NR_exit: return "exit";

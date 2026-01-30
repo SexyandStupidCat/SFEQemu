@@ -119,6 +119,29 @@ function do_syscall(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)
         return 0, 0
     end
 
+    -- /dev/nvram：强制走“安全 fd + Lua 侧仿真”，避免打开真实 nvram 设备导致 -EBUSY/-EINVAL。
+    if path == "/dev/nvram" then
+        if type(c_open_host) == "function" then
+            local ret = c_open_host("/dev/zero", flags, mode)
+            if type(ret) == "number" and ret >= 0 then
+                fdmap.set(ret, {
+                    kind = "dev",
+                    path = "/dev/nvram",
+                    flags = math.floor(tonumber(flags) or 0),
+                    mode = math.floor(tonumber(mode) or 0),
+                    is_fake = true,
+                })
+                c_log(string.format("[open.nvram] opened /dev/zero fd=%d (mapped as /dev/nvram)", ret))
+                return 1, ret
+            end
+            if type(ret) == "number" then
+                c_log(string.format("[open.nvram] c_open_host failed ret=%d", ret))
+                return 1, ret
+            end
+        end
+        -- 兜底：旧二进制无 c_open_host 时继续走原逻辑（可能失败）
+    end
+
     local action, ret = fakefile.handle_open(num, pathname, flags, mode, arg4, arg5, arg6, arg7, arg8)
 
     if action == 1 and type(ret) == "number" and ret >= 0 and path ~= "" then

@@ -29,6 +29,22 @@ FORCE_SDGEN="${FORCE_SDGEN:-0}"
 FORCE_SFANALYSIS="${FORCE_SFANALYSIS:-0}"
 FORCE_DOCKER="${FORCE_DOCKER:-1}"
 
+# Docker 行为控制（默认保持“批量脚本跑完即退出”的语义）
+#
+# 背景：批量脚本的 Docker 步骤会在 curl 验证成功后立刻退出容器并清理 qemu-arm，
+# 这对“批量统计成功率”很友好，但如果你想在宿主机浏览器里打开页面，
+# 容器会很快结束（看起来像“访问一下就退出”）。
+#
+# 用法示例（单固件调试/浏览器访问）：
+#   DOCKER_KEEPALIVE=1 DOCKER_DETACH=1 DOCKER_PUBLISH=1 HOST_HTTP_PORT=18080 \
+#     ./lab/run_batch_001.sh lab/batch_single_rt_ac1300uhp.txt
+DOCKER_KEEPALIVE="${DOCKER_KEEPALIVE:-0}"   # 1=验证后不退出（保持 qemu-arm 运行）
+DOCKER_DETACH="${DOCKER_DETACH:-0}"         # 1=后台启动容器（docker run -d）
+DOCKER_RM="${DOCKER_RM:-1}"                 # 1=容器退出后自动删除（等价 --rm）
+DOCKER_PUBLISH="${DOCKER_PUBLISH:-0}"       # 1=发布端口到宿主机（-p）
+HOST_HTTP_PORT="${HOST_HTTP_PORT:-18080}"   # DOCKER_PUBLISH=1 时映射到宿主机的 HTTP 端口
+HOST_HTTPS_PORT="${HOST_HTTPS_PORT:-18443}" # DOCKER_PUBLISH=1 时映射到宿主机的 HTTPS 端口
+
 if [[ ! -f "${BATCH_FILE}" ]]; then
   echo "[!] batch 文件不存在：${BATCH_FILE}" >&2
   exit 1
@@ -162,14 +178,42 @@ EOF
   # ---- Docker 仿真 + curl 验证 ----
   if [[ "${FORCE_DOCKER}" != "0" ]]; then
     echo "[+] Docker emulate + curl..."
-    docker run --rm --privileged \
-      -e TERM \
-      -v "${rootfs}:/rootfs:rw" \
-      -v "${SFEMU_ROOT}:${SFEMU_ROOT}:rw" \
-      -w /rootfs \
-      "${IMAGE_TAG}" \
-      /bin/bash -lc "
+
+    local ts container_name
+    ts="$(date +%Y%m%d_%H%M%S)"
+    container_name="sfemu-${fw_name}-${ts}"
+    # Docker name 仅允许 [a-zA-Z0-9][a-zA-Z0-9_.-]，这里保守替换非法字符
+    container_name="$(echo "${container_name}" | tr -c 'a-zA-Z0-9_.-' '_')"
+
+    docker_args=(docker run)
+    if [[ "${DOCKER_RM}" != "0" ]]; then
+      docker_args+=(--rm)
+    fi
+    docker_args+=(--privileged -e TERM)
+    if [[ "${DOCKER_PUBLISH}" != "0" ]]; then
+      docker_args+=(-p "${HOST_HTTP_PORT}:80" -p "${HOST_HTTPS_PORT}:443")
+    fi
+    if [[ "${DOCKER_KEEPALIVE}" != "0" || "${DOCKER_DETACH}" != "0" ]]; then
+      docker_args+=(--name "${container_name}")
+    fi
+    if [[ "${DOCKER_DETACH}" != "0" ]]; then
+      docker_args+=(-d)
+    fi
+    docker_args+=(
+      -v "${rootfs}:/rootfs:rw"
+      -v "${SFEMU_ROOT}:${SFEMU_ROOT}:rw"
+      -w /rootfs
+      "${IMAGE_TAG}"
+      /bin/bash -lc
+    )
+
+    "${docker_args[@]}" "
       set -euo pipefail
+      KEEPALIVE=\"${DOCKER_KEEPALIVE}\"
+      PUBLISH=\"${DOCKER_PUBLISH}\"
+      HOST_HTTP_PORT=\"${HOST_HTTP_PORT}\"
+      HOST_HTTPS_PORT=\"${HOST_HTTPS_PORT}\"
+      CONTAINER_NAME=\"${container_name}\"
 
       mkdir -p /rootfs/sfemu_lab
       date -Is > /rootfs/sfemu_lab/docker.started_at
@@ -205,6 +249,20 @@ EOF
       cp -f /etc/ssl/certs/ca-certificates.crt \"\${ROOT}/tmp/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null || true
 
       # 后台启动 qemu-user(httpd)
+      qpid=\"\"
+      cleanup() {
+        set +e
+        # 收尾：尽力杀掉 qemu-arm（避免残留）；容器退出会自动回收 mount namespace
+        if [[ -n \"\${qpid}\" ]]; then
+          kill \"\${qpid}\" 2>/dev/null || true
+          sleep 1 || true
+          wait \"\${qpid}\" 2>/dev/null || true
+        fi
+        pkill -9 -f qemu-arm 2>/dev/null || true
+        date -Is > /rootfs/sfemu_lab/docker.finished_at
+      }
+      trap cleanup EXIT
+
       chroot \"\${ROOT}\" /start.sh > /rootfs/sfemu_lab/chroot_start.stdout.log 2> /rootfs/sfemu_lab/chroot_start.stderr.log &
       qpid=\$!
       echo \"\$qpid\" > /rootfs/sfemu_lab/chroot.pid
@@ -261,15 +319,41 @@ EOF
       fi
       ss -lntp > /rootfs/sfemu_lab/ss.lntp.txt 2>/dev/null || true
 
-      # 收尾：尽力杀掉 qemu-arm（避免残留）；容器退出会自动回收 mount namespace
-      kill \"\$qpid\" 2>/dev/null || true
-      sleep 1 || true
-      pkill -9 -f qemu-arm 2>/dev/null || true
-      wait \"\$qpid\" 2>/dev/null || true
+      if [[ \"\${KEEPALIVE}\" == \"1\" ]]; then
+        date -Is > /rootfs/sfemu_lab/docker.ready_at
+        echo \"[docker] KEEPALIVE=1：保持容器运行（不自动退出/不杀 qemu-arm）\"
+        if [[ \"\${PUBLISH}\" == \"1\" ]]; then
+          echo \"[docker] 宿主机可访问：\"
+          echo \"  http://127.0.0.1:\${HOST_HTTP_PORT}/QIS_wizard.htm?flag=welcome\"
+          echo \"  https://127.0.0.1:\${HOST_HTTPS_PORT}/  (若固件启了 HTTPS)\"
+	        else
+	          echo \"[docker] 未发布端口（DOCKER_PUBLISH=0）。若宿主机能直连容器网段，可用容器 IP 访问。\"
+	          ip -4 -o addr show dev eth0 2>/dev/null || true
+	        fi
+        echo \"[docker] 容器名：\${CONTAINER_NAME}\"
+        echo \"[docker] 停止：docker stop \${CONTAINER_NAME}\"
+        # 阻塞保持运行（可改为 tail -f 观察日志）
+        while true; do sleep 3600; done
+      fi
 
-      date -Is > /rootfs/sfemu_lab/docker.finished_at
       exit 0
     " >"${lab_dir}/docker.stdout.log" 2>"${lab_dir}/docker.stderr.log" || true
+
+    # detach 模式下，docker stdout 是 container id，落到 docker.stdout.log；额外写一份便于脚本/人读取
+    if [[ "${DOCKER_DETACH}" != "0" ]]; then
+      local cid
+      cid="$(head -n 1 "${lab_dir}/docker.stdout.log" 2>/dev/null | tr -d $'\r\n' || true)"
+      if [[ -n "${cid}" ]]; then
+        echo "${cid}" > "${lab_dir}/docker.container_id"
+        echo "${container_name}" > "${lab_dir}/docker.container_name"
+        echo "[+] Docker 已后台启动：name=${container_name} id=${cid}"
+        if [[ "${DOCKER_PUBLISH}" != "0" ]]; then
+          echo "[+] 浏览器访问：http://127.0.0.1:${HOST_HTTP_PORT}/QIS_wizard.htm?flag=welcome"
+        fi
+      else
+        echo "[!] Docker 后台启动失败：未拿到 container id（见 ${lab_dir}/docker.stderr.log）" >&2
+      fi
+    fi
   else
     echo "[=] Docker: 跳过（FORCE_DOCKER=0）"
   fi

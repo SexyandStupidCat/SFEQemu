@@ -1,0 +1,15 @@
+# batch_ai_asus_httpd_7.txt
+# 格式：<httpd_abs_path><空格><rootfs_dir>
+#
+# 说明：
+# - 用于验证 AI MCP 的“工具调用 + filesystem 干预”能力
+# - 仅包含用户指定的 7 个 ASUS 固件（ARM /usr/sbin/httpd）
+
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200G_300438250624/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200G_300438250624/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200GPlus_300438250624/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200GPlus_300438250624/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1750_B1_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1750_B1_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900P_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900P_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900U_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1900U_300438432738/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC3100_300438432738/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC3100_300438432738/rootfs
+

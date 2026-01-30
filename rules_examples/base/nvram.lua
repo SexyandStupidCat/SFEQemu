@@ -71,7 +71,8 @@ local function ensure_defaults(st)
         http_lanport = "80",
         https_lanport = "443",
         https_enable = "0",
-        http_enable = "1",
+        -- ASUS/Broadcom 常见约定：http_enable=0 表示启用，=1 表示禁用（否则 httpd 会跳过 bind 并进入 nfds=0 的 select 循环）
+        http_enable = "0",
         lan_ipaddr = "192.168.1.1",
         lan_netmask = "255.255.255.0",
         lan_proto = "dhcp",
@@ -285,4 +286,3 @@ function M.handle_write(_num, fd, buf, count)
 end
 
 return M
-

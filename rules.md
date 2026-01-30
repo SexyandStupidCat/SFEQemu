@@ -37,6 +37,14 @@
   - 逻辑：`rules_examples/base/nvram.lua`、`rules_examples/base/fdmap.lua`
   - 引擎：`linux-user/syscall.c`（`c_open_host` + `get_syscall_name` 补齐 `execveat`）
 
+#### 1.3.1 ASUS `httpd` 的 `http_enable` 语义（易踩坑）
+
+- 现象（批量高频）：`httpd` 完成 SSL/NVRAM 初始化并写入 `/var/run/httpd.pid`，但始终不 `listen()`，`ss -lntp` 为空；
+  日志中可观测到 `select(nfds=0)` 周期性返回（60s timeout 或 timeout==NULL），看起来像“卡住/死循环”。
+- 根因：部分 ASUS 固件里 `http_enable` 的语义是 **0=启用，1=禁用**。若默认给成 `1`，`httpd` 会跳过 `bind()/listen()` 分支，
+  最终进入 “nfds=0 的 select 等待” 分支（不会对外提供服务）。
+- 修复（通用）：`rules_examples/base/nvram.lua` 将默认 `http_enable` 改为 `"0"`（启用 HTTP）。
+
 ### 1.4 /dev/log 缺失（syslog socket）
 
 - 现象：`connect("/dev/log") = -ENOENT`，部分固件会因此异常退出。

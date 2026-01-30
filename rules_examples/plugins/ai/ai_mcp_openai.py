@@ -14,18 +14,33 @@ ai_mcp_openai.py - 内置“类 MCP”能力：读取快照 -> 调用 OpenAI 兼
   - 本脚本作为 rules/plugins/ 下的插件式工具使用。
   - 本脚本只负责“生成规则文件”；是否应用/验证/导出 stable_rules 由 base/ai.lua 负责。
   - env 文件中读取：OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL
+
+扩展能力（可选）：
+  - 支持 OpenAI “tools/tool_calls” 接口：模型可调用一组受限的“干预工具”（文件读写、目录创建、软链等）
+  - 即使网关不支持 tools，也可在最终 JSON 中输出 "actions"（脚本会按白名单执行并记录到 ai_actions.json）
+
+安全边界（默认偏保守，可通过 env 调整）：
+  - 仅当检测到“在固件 rootfs 环境”时才允许写入（避免误写宿主机）
+  - 允许写入的路径必须位于 safe_root（通常为 / 或 <rootfs>）
+  - shell 执行默认关闭（避免在不可信环境下执行任意命令）
 """
 
 from __future__ import annotations
 
+import base64
+import glob
 import json
 import os
 import re
+import shutil
+import ssl
+import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from typing import Dict, Any, Tuple, Optional
+from typing import Dict, Any, Tuple, Optional, List
 
 
 def eprint(*args: object) -> None:
@@ -95,6 +110,734 @@ def normalize_chat_completions_url(base: str) -> str:
     return base + "/v1/chat/completions"
 
 
+def pick_ca_bundle(env: Dict[str, str]) -> Optional[str]:
+    """
+    为 OpenAI/兼容网关的 HTTPS 请求挑选 CA bundle。
+
+    背景：固件 rootfs 常缺少系统 CA，导致 urllib 报：
+      CERTIFICATE_VERIFY_FAILED: unable to get local issuer certificate
+
+    策略：优先使用 env 显式配置，其次使用常见系统路径（兼容 /etc -> /tmp/etc）。
+    """
+
+    cand: List[str] = []
+    for k in ("OPENAI_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
+        v = (env.get(k) or "").strip()
+        if v:
+            cand.append(v)
+
+    cand.extend(
+        [
+            "/etc/ssl/certs/ca-certificates.crt",
+            "/etc/ssl/cert.pem",
+            "/tmp/etc/ssl/certs/ca-certificates.crt",
+            "/tmp/etc/ssl/cert.pem",
+        ]
+    )
+
+    for p in cand:
+        try:
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            continue
+    return None
+
+
+def detect_safe_root(run_dir: str) -> Optional[str]:
+    """
+    尽量判定“可以写入的固件 rootfs 根目录”，避免误写宿主机。
+
+    返回：
+      - "/" ：已在 chroot(rootfs) 内（固件根即 /）
+      - "<abs>"：未 chroot，但规则目录位于 <abs>/rules_examples（可写入 <abs>）
+      - None：无法确认在固件 rootfs，默认禁用写入类动作
+    """
+
+    # 1) 明确 marker：/.init_enable_core（约定：放在 rootfs 根）
+    if os.path.isfile("/.init_enable_core"):
+        return "/"
+
+    # 2) 启发式：rootfs 根常见注入 qemu-arm 与 rules_examples
+    if os.path.isfile("/qemu-arm") and os.path.isfile("/rules_examples/entry.lua"):
+        return "/"
+
+    # 3) 相对 cwd 的 marker（便于宿主机直接在 rootfs 目录运行 ./start.sh）
+    if os.path.isfile("./.init_enable_core"):
+        return os.path.abspath(".")
+    if os.path.isfile("./rules_examples/entry.lua") and (os.path.isfile("./qemu-arm") or os.path.isfile("./usr/sbin/httpd")):
+        return os.path.abspath(".")
+
+    # 4) 从 run_dir 反推：.../<rootfs>/rules_examples/cache/ai_runs/<run_id>
+    rd = os.path.abspath(run_dir or "")
+    needle = os.sep + "rules_examples" + os.sep
+    i = rd.find(needle)
+    if i >= 0:
+        root_guess = rd[:i] or "/"
+        # 校验：root_guess 下应存在 rules_examples/entry.lua
+        entry = os.path.join(root_guess, "rules_examples", "entry.lua")
+        if os.path.isfile(entry):
+            return root_guess
+
+    return None
+
+
+def _abspath(path: str) -> str:
+    return os.path.abspath(os.path.expanduser(path))
+
+
+def _within_root(path: str, safe_root: str) -> bool:
+    if not safe_root:
+        safe_root = "/"
+    safe_root = _abspath(safe_root)
+    path_abs = _abspath(path)
+    if safe_root == "/":
+        return True
+    try:
+        return os.path.commonpath([safe_root, path_abs]) == safe_root
+    except Exception:
+        return False
+
+
+def _parse_mode(mode: Any, default: int) -> int:
+    if mode is None:
+        return default
+    if isinstance(mode, int):
+        return mode
+    s = str(mode).strip()
+    if not s:
+        return default
+    # 支持 "0755"/"644" 等八进制字符串
+    try:
+        if s.startswith("0"):
+            return int(s, 8)
+        # 仅当全为数字才按八进制解释；避免把 "493" 误当十进制
+        if re.fullmatch(r"[0-7]+", s):
+            return int(s, 8)
+        return int(s, 10)
+    except Exception:
+        return default
+
+
+def is_allowed_http_host(host: str) -> bool:
+    """
+    http_get 的目标 host 白名单。
+
+    约束目标：
+    - 默认禁止访问公网，避免将固件文件/上下文泄露到外部；
+    - 允许访问本机/私网地址，用于验证固件 httpd 是否可用（127.0.0.1、容器内 172.17.*、常见 192.168.* 等）。
+    """
+
+    h = (host or "").strip().lower()
+    if h in ("", "localhost", "127.0.0.1", "::1"):
+        return True
+
+    m = re.fullmatch(r"(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})", h)
+    if not m:
+        return False
+    try:
+        a, b, c, d = (int(x) for x in m.groups())
+    except Exception:
+        return False
+    if not (0 <= a <= 255 and 0 <= b <= 255 and 0 <= c <= 255 and 0 <= d <= 255):
+        return False
+
+    # 127.0.0.0/8
+    if a == 127:
+        return True
+    # 10.0.0.0/8
+    if a == 10:
+        return True
+    # 172.16.0.0/12
+    if a == 172 and 16 <= b <= 31:
+        return True
+    # 192.168.0.0/16
+    if a == 192 and b == 168:
+        return True
+    # 169.254.0.0/16（link-local）
+    if a == 169 and b == 254:
+        return True
+
+    return False
+
+
+class ActionRunner:
+    """
+    记录/执行 AI 干预动作（工具调用）。
+    """
+
+    def __init__(
+        self,
+        safe_root: Optional[str],
+        allow_write: bool,
+        allow_shell: bool,
+        allow_net: bool,
+        ip_bin: Optional[str] = None,
+        assume_container: bool = False,
+    ):
+        self.safe_root = safe_root
+        self.allow_write = allow_write
+        self.allow_shell = allow_shell
+        self.allow_net = allow_net
+        self.ip_bin = (ip_bin or "").strip()
+        self.assume_container = bool(assume_container)
+        self.actions: List[Dict[str, Any]] = []
+        self.mutations_applied = 0
+
+    def _deny(self, tool: str, reason: str, args: Any = None) -> Dict[str, Any]:
+        rec = {"tool": tool, "ok": False, "deny_reason": reason, "args": args}
+        self.actions.append(rec)
+        return rec
+
+    def _record(self, tool: str, ok: bool, args: Any, result: Any, mutating: bool) -> Dict[str, Any]:
+        rec = {"tool": tool, "ok": bool(ok), "args": args, "result": result}
+        self.actions.append(rec)
+        if ok and mutating:
+            self.mutations_applied += 1
+        return rec
+
+    def _check_path(self, p: str) -> Tuple[bool, str]:
+        if not self.safe_root:
+            return False, "no_safe_root"
+        if not _within_root(p, self.safe_root):
+            return False, "path_outside_safe_root"
+        return True, ""
+
+    def fs_read_text(self, path: str, max_bytes: int = 64 * 1024) -> Dict[str, Any]:
+        try:
+            p = str(path)
+            okp, why = self._check_path(p)
+            if not okp:
+                return self._deny("fs_read_text", why, {"path": path, "max_bytes": max_bytes})
+            data = read_text_if_exists(p, max_bytes)
+            truncated = False
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) > max_bytes:
+                    truncated = True
+            except Exception:
+                pass
+            return self._record("fs_read_text", True, {"path": path, "max_bytes": max_bytes}, {"text": data, "truncated": truncated}, False)
+        except Exception as ex:
+            return self._record("fs_read_text", False, {"path": path, "max_bytes": max_bytes}, {"error": str(ex)}, False)
+
+    def _is_container(self) -> bool:
+        if self.assume_container:
+            return True
+        # docker / podman 常见 marker
+        if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+            return True
+        for cg in ("/proc/self/cgroup", "/proc/1/cgroup"):
+            try:
+                with open(cg, "r", encoding="utf-8", errors="replace") as f:
+                    data = f.read()
+                if any(x in data for x in ("docker", "containerd", "kubepods", "libpod")):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _find_ip(self) -> Optional[str]:
+        cand: List[str] = []
+        if self.ip_bin:
+            cand.append(self.ip_bin)
+        cand.extend(("/sfemu_tools/ip", "/usr/sbin/ip", "/sbin/ip", "/bin/ip"))
+        for p in cand:
+            if p and os.path.isfile(p) and os.access(p, os.X_OK):
+                return p
+        w = shutil.which("ip")
+        if w:
+            return w
+        return None
+
+    def _run_cmd(self, argv: List[str], timeout_ms: int = 5000, max_output: int = 65536) -> Tuple[int, str]:
+        p = subprocess.run(
+            [str(x) for x in argv],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=max(0.1, float(timeout_ms) / 1000.0),
+            check=False,
+            text=True,
+            errors="replace",
+        )
+        out = p.stdout or ""
+        limit = int(max_output or 0) or 65536
+        if len(out) > limit:
+            out = out[:limit] + "\n...(truncated)\n"
+        return int(p.returncode or 0), out
+
+    def net_if_list(self, timeout_ms: int = 2000, max_output: int = 65536) -> Dict[str, Any]:
+        if not self.allow_net:
+            return self._deny("net_if_list", "net_disabled", {})
+        if not self.safe_root:
+            return self._deny("net_if_list", "no_safe_root", {})
+        if not self._is_container():
+            return self._deny("net_if_list", "not_in_container", {})
+        ip = self._find_ip()
+        if not ip:
+            return self._record("net_if_list", False, {"timeout_ms": timeout_ms, "max_output": max_output}, {"error": "ip_not_found"}, False)
+        try:
+            rc, out = self._run_cmd([ip, "-j", "addr", "show"], timeout_ms=timeout_ms, max_output=max_output)
+            if rc == 0:
+                try:
+                    data = json.loads(out)
+                except Exception:
+                    data = {"raw": out}
+                return self._record("net_if_list", True, {"timeout_ms": timeout_ms, "max_output": max_output}, {"returncode": rc, "data": data}, False)
+            return self._record("net_if_list", False, {"timeout_ms": timeout_ms, "max_output": max_output}, {"returncode": rc, "output": out}, False)
+        except Exception as ex:
+            return self._record("net_if_list", False, {"timeout_ms": timeout_ms, "max_output": max_output}, {"error": str(ex)}, False)
+
+    def net_ensure_addr(self, iface: str, cidr: str, kind: str = "dummy", up: bool = True, timeout_ms: int = 5000) -> Dict[str, Any]:
+        """
+        保障网络环境（通用干预）：
+        - 若 iface 不存在：创建（dummy/bridge）
+        - 设为 up
+        - 确保 iface 上存在 cidr（若已存在则跳过）
+        """
+        if not self.allow_net:
+            return self._deny("net_ensure_addr", "net_disabled", {"iface": iface, "cidr": cidr, "kind": kind, "up": up})
+        if not self.safe_root:
+            return self._deny("net_ensure_addr", "no_safe_root", {"iface": iface, "cidr": cidr, "kind": kind, "up": up})
+        if not self._is_container():
+            return self._deny("net_ensure_addr", "not_in_container", {"iface": iface, "cidr": cidr, "kind": kind, "up": up})
+
+        ifname = str(iface or "").strip()
+        addr = str(cidr or "").strip()
+        k = str(kind or "dummy").strip().lower()
+        if k not in ("dummy", "bridge"):
+            k = "dummy"
+
+        if not ifname or not addr:
+            return self._record("net_ensure_addr", False, {"iface": iface, "cidr": cidr, "kind": kind, "up": up}, {"error": "missing_iface_or_cidr"}, False)
+
+        ip = self._find_ip()
+        if not ip:
+            return self._record("net_ensure_addr", False, {"iface": iface, "cidr": cidr, "kind": kind, "up": up}, {"error": "ip_not_found"}, False)
+
+        mutated = False
+        outputs: List[Dict[str, Any]] = []
+        try:
+            sys_net = f"/sys/class/net/{ifname}"
+            if not os.path.isdir(sys_net):
+                rc, out = self._run_cmd([ip, "link", "add", ifname, "type", k], timeout_ms=timeout_ms)
+                outputs.append({"argv": [ip, "link", "add", ifname, "type", k], "returncode": rc, "output": out})
+                if rc != 0:
+                    return self._record("net_ensure_addr", False, {"iface": iface, "cidr": cidr, "kind": k, "up": up}, {"steps": outputs}, False)
+                mutated = True
+
+            if up:
+                rc, out = self._run_cmd([ip, "link", "set", "dev", ifname, "up"], timeout_ms=timeout_ms)
+                outputs.append({"argv": [ip, "link", "set", "dev", ifname, "up"], "returncode": rc, "output": out})
+                if rc == 0:
+                    mutated = True
+
+            # 是否已存在该地址
+            already = False
+            rc, out = self._run_cmd([ip, "-j", "addr", "show", "dev", ifname], timeout_ms=timeout_ms)
+            if rc == 0:
+                try:
+                    data = json.loads(out)
+                    for item in data if isinstance(data, list) else []:
+                        for a in item.get("addr_info") or []:
+                            local = a.get("local")
+                            prefixlen = a.get("prefixlen")
+                            if local is None or prefixlen is None:
+                                continue
+                            if f"{local}/{prefixlen}" == addr:
+                                already = True
+                                break
+                        if already:
+                            break
+                except Exception:
+                    pass
+
+            if not already:
+                rc, out = self._run_cmd([ip, "addr", "add", addr, "dev", ifname], timeout_ms=timeout_ms)
+                outputs.append({"argv": [ip, "addr", "add", addr, "dev", ifname], "returncode": rc, "output": out})
+                if rc == 0:
+                    mutated = True
+            else:
+                outputs.append({"note": "addr_exists", "addr": addr})
+
+            return self._record("net_ensure_addr", True, {"iface": ifname, "cidr": addr, "kind": k, "up": up}, {"steps": outputs}, mutated)
+        except Exception as ex:
+            return self._record("net_ensure_addr", False, {"iface": iface, "cidr": cidr, "kind": kind, "up": up}, {"error": str(ex), "steps": outputs}, mutated)
+
+    def fs_read_bytes_b64(self, path: str, max_bytes: int = 4096, offset: int = 0) -> Dict[str, Any]:
+        try:
+            p = str(path)
+            okp, why = self._check_path(p)
+            if not okp:
+                return self._deny("fs_read_bytes_b64", why, {"path": path, "max_bytes": max_bytes, "offset": offset})
+            offset_i = int(offset or 0)
+            max_i = int(max_bytes or 0)
+            if max_i <= 0:
+                max_i = 1
+            with open(p, "rb") as f:
+                if offset_i > 0:
+                    f.seek(offset_i)
+                data = f.read(max_i)
+            b64 = base64.b64encode(data).decode("ascii")
+            more = False
+            try:
+                if os.path.isfile(p) and os.path.getsize(p) > offset_i + len(data):
+                    more = True
+            except Exception:
+                pass
+            return self._record(
+                "fs_read_bytes_b64",
+                True,
+                {"path": path, "max_bytes": max_bytes, "offset": offset},
+                {"b64": b64, "n": len(data), "more": more},
+                False,
+            )
+        except Exception as ex:
+            return self._record("fs_read_bytes_b64", False, {"path": path, "max_bytes": max_bytes, "offset": offset}, {"error": str(ex)}, False)
+
+    def fs_listdir(self, path: str, max_entries: int = 200) -> Dict[str, Any]:
+        try:
+            p = str(path)
+            okp, why = self._check_path(p)
+            if not okp:
+                return self._deny("fs_listdir", why, {"path": path, "max_entries": max_entries})
+            items = []
+            for name in sorted(os.listdir(p))[: int(max_entries or 0) or 200]:
+                items.append(name)
+            return self._record("fs_listdir", True, {"path": path, "max_entries": max_entries}, {"entries": items}, False)
+        except Exception as ex:
+            return self._record("fs_listdir", False, {"path": path, "max_entries": max_entries}, {"error": str(ex)}, False)
+
+    def fs_glob(self, pattern: str, max_results: int = 200) -> Dict[str, Any]:
+        try:
+            pat = str(pattern)
+            # glob 本身可能跨目录，这里只在结果集层面做 safe_root 校验
+            results = sorted(glob.glob(pat, recursive=True))
+            limit = int(max_results or 0) or 200
+            safe = []
+            for p in results:
+                if self.safe_root and _within_root(p, self.safe_root):
+                    safe.append(p)
+                if len(safe) >= limit:
+                    break
+            return self._record("fs_glob", True, {"pattern": pattern, "max_results": max_results}, {"paths": safe, "total": len(results)}, False)
+        except Exception as ex:
+            return self._record("fs_glob", False, {"pattern": pattern, "max_results": max_results}, {"error": str(ex)}, False)
+
+    def fs_mkdir_p(self, path: str, mode: Any = None) -> Dict[str, Any]:
+        if not self.allow_write:
+            return self._deny("fs_mkdir_p", "write_disabled", {"path": path, "mode": mode})
+        try:
+            p = str(path)
+            okp, why = self._check_path(p)
+            if not okp:
+                return self._deny("fs_mkdir_p", why, {"path": path, "mode": mode})
+            m = _parse_mode(mode, 0o755)
+            os.makedirs(p, exist_ok=True)
+            try:
+                os.chmod(p, m)
+            except Exception:
+                pass
+            return self._record("fs_mkdir_p", True, {"path": path, "mode": mode}, {"created": True}, True)
+        except Exception as ex:
+            return self._record("fs_mkdir_p", False, {"path": path, "mode": mode}, {"error": str(ex)}, True)
+
+    def fs_write_text(self, path: str, content: str, mode: Any = None, mkdirs: bool = True, overwrite: bool = True) -> Dict[str, Any]:
+        if not self.allow_write:
+            return self._deny("fs_write_text", "write_disabled", {"path": path})
+        try:
+            p = str(path)
+            okp, why = self._check_path(p)
+            if not okp:
+                return self._deny("fs_write_text", why, {"path": path})
+            if mkdirs:
+                os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
+            if (not overwrite) and os.path.exists(p):
+                return self._record("fs_write_text", True, {"path": path, "mode": mode, "mkdirs": mkdirs, "overwrite": overwrite}, {"skipped": True, "reason": "exists"}, False)
+            data = str(content or "")
+            with open(p, "w", encoding="utf-8", errors="replace") as f:
+                f.write(data)
+            if mode is not None:
+                try:
+                    os.chmod(p, _parse_mode(mode, 0o644))
+                except Exception:
+                    pass
+            return self._record("fs_write_text", True, {"path": path, "mode": mode, "mkdirs": mkdirs, "overwrite": overwrite}, {"n": len(data)}, True)
+        except Exception as ex:
+            return self._record("fs_write_text", False, {"path": path, "mode": mode, "mkdirs": mkdirs, "overwrite": overwrite}, {"error": str(ex)}, True)
+
+    def fs_symlink(self, target: str, link_path: str, force: bool = True) -> Dict[str, Any]:
+        if not self.allow_write:
+            return self._deny("fs_symlink", "write_disabled", {"target": target, "link_path": link_path})
+        try:
+            lp = str(link_path)
+            okp, why = self._check_path(lp)
+            if not okp:
+                return self._deny("fs_symlink", why, {"target": target, "link_path": link_path})
+            if force and os.path.lexists(lp):
+                try:
+                    if os.path.isdir(lp) and not os.path.islink(lp):
+                        return self._record("fs_symlink", False, {"target": target, "link_path": link_path, "force": force}, {"error": "link_path_is_dir"}, True)
+                    os.unlink(lp)
+                except Exception as ex:
+                    return self._record("fs_symlink", False, {"target": target, "link_path": link_path, "force": force}, {"error": str(ex)}, True)
+            os.makedirs(os.path.dirname(lp) or ".", exist_ok=True)
+            os.symlink(str(target), lp)
+            return self._record("fs_symlink", True, {"target": target, "link_path": link_path, "force": force}, {"created": True}, True)
+        except Exception as ex:
+            return self._record("fs_symlink", False, {"target": target, "link_path": link_path, "force": force}, {"error": str(ex)}, True)
+
+    def fs_copy(self, src: str, dst: str, overwrite: bool = True) -> Dict[str, Any]:
+        if not self.allow_write:
+            return self._deny("fs_copy", "write_disabled", {"src": src, "dst": dst})
+        try:
+            s = str(src)
+            d = str(dst)
+            oks, why_s = self._check_path(s)
+            if not oks:
+                return self._deny("fs_copy", why_s, {"src": src, "dst": dst})
+            okd, why = self._check_path(d)
+            if not okd:
+                return self._deny("fs_copy", why, {"src": src, "dst": dst})
+            if (not overwrite) and os.path.exists(d):
+                return self._record("fs_copy", True, {"src": src, "dst": dst, "overwrite": overwrite}, {"skipped": True, "reason": "exists"}, False)
+            os.makedirs(os.path.dirname(d) or ".", exist_ok=True)
+            shutil.copy2(s, d)
+            return self._record("fs_copy", True, {"src": src, "dst": dst, "overwrite": overwrite}, {"copied": True}, True)
+        except Exception as ex:
+            return self._record("fs_copy", False, {"src": src, "dst": dst, "overwrite": overwrite}, {"error": str(ex)}, True)
+
+    def http_get(self, url: str, timeout_ms: int = 2000, max_bytes: int = 8192) -> Dict[str, Any]:
+        try:
+            u = str(url)
+            # 出于安全：默认仅允许访问本机/私网（用于验证固件 http 服务），禁止访问公网。
+            pu = urllib.parse.urlparse(u)
+            host = (pu.hostname or "").lower()
+            if not is_allowed_http_host(host):
+                return self._deny("http_get", "host_not_allowed", {"url": url})
+            req = urllib.request.Request(u, method="GET", headers={"User-Agent": "sfemu-ai/1.0"})
+            with urllib.request.urlopen(req, timeout=max(0.1, float(timeout_ms) / 1000.0)) as resp:
+                data = resp.read(int(max_bytes or 0) or 8192)
+                headers = dict(resp.headers.items())
+                return self._record(
+                    "http_get",
+                    True,
+                    {"url": url, "timeout_ms": timeout_ms, "max_bytes": max_bytes},
+                    {"status": getattr(resp, "status", None), "headers": headers, "body_snippet": data.decode("utf-8", errors="replace")},
+                    False,
+                )
+        except Exception as ex:
+            return self._record("http_get", False, {"url": url, "timeout_ms": timeout_ms, "max_bytes": max_bytes}, {"error": str(ex)}, False)
+
+    def shell_run(self, argv: List[str], timeout_ms: int = 5000, max_output: int = 65536) -> Dict[str, Any]:
+        if not self.allow_shell:
+            return self._deny("shell_run", "shell_disabled", {"argv": argv})
+        if not isinstance(argv, list) or not argv:
+            return self._record("shell_run", False, {"argv": argv}, {"error": "argv_empty"}, False)
+        try:
+            # 仅允许白名单命令（可按需扩展）
+            allow = {
+                "ls", "cat", "head", "tail", "stat", "file",
+                "mkdir", "ln", "cp", "mv", "rm",
+                "grep", "sed", "awk", "find",
+                "ps", "ss", "netstat", "ip", "ifconfig", "route",
+                "curl", "wget",
+                "openssl",
+            }
+            cmd = str(argv[0])
+            base = os.path.basename(cmd)
+            if base not in allow:
+                return self._deny("shell_run", "cmd_not_allowed", {"argv": argv})
+            rc, out = self._run_cmd([str(x) for x in argv], timeout_ms=timeout_ms, max_output=max_output)
+            mut = False
+            ro = {"ls", "cat", "head", "tail", "stat", "file", "grep", "sed", "awk", "find", "ps", "ss", "netstat", "curl", "wget"}
+            wr = {"mkdir", "ln", "cp", "mv", "rm", "ip", "ifconfig", "route", "openssl"}
+            if base in wr:
+                if base == "ip":
+                    # ip 的 show 类命令本身无副作用；仅当出现 add/del/set/flush/replace 才计为变更
+                    mut = any(str(x) in ("add", "del", "set", "flush", "replace") for x in argv[1:6])
+                elif base == "ifconfig":
+                    mut = len(argv) >= 3
+                elif base == "route":
+                    mut = any(str(x) in ("add", "del", "change", "replace") for x in argv[1:6])
+                else:
+                    mut = True
+            elif base in ro:
+                mut = False
+            else:
+                # 默认保守：不计入变更（避免模型仅做观测就触发 re-exec）
+                mut = False
+            return self._record("shell_run", True, {"argv": argv, "timeout_ms": timeout_ms, "max_output": max_output}, {"returncode": rc, "output": out}, mut)
+        except Exception as ex:
+            return self._record("shell_run", False, {"argv": argv, "timeout_ms": timeout_ms, "max_output": max_output}, {"error": str(ex)}, True)
+
+    def run_action(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        tool = str(tool or "")
+        args = args or {}
+        if tool == "fs_read_text":
+            return self.fs_read_text(args.get("path", ""), int(args.get("max_bytes") or 64 * 1024))
+        if tool == "fs_read_bytes_b64":
+            return self.fs_read_bytes_b64(args.get("path", ""), int(args.get("max_bytes") or 4096), int(args.get("offset") or 0))
+        if tool == "fs_listdir":
+            return self.fs_listdir(args.get("path", ""), int(args.get("max_entries") or 200))
+        if tool == "fs_glob":
+            return self.fs_glob(args.get("pattern", ""), int(args.get("max_results") or 200))
+        if tool == "fs_mkdir_p":
+            return self.fs_mkdir_p(args.get("path", ""), args.get("mode"))
+        if tool == "fs_write_text":
+            return self.fs_write_text(
+                args.get("path", ""),
+                args.get("content", ""),
+                mode=args.get("mode"),
+                mkdirs=bool(args.get("mkdirs", True)),
+                overwrite=bool(args.get("overwrite", True)),
+            )
+        if tool == "fs_symlink":
+            return self.fs_symlink(args.get("target", ""), args.get("link_path", ""), force=bool(args.get("force", True)))
+        if tool == "fs_copy":
+            return self.fs_copy(args.get("src", ""), args.get("dst", ""), overwrite=bool(args.get("overwrite", True)))
+        if tool == "http_get":
+            return self.http_get(args.get("url", ""), int(args.get("timeout_ms") or 2000), int(args.get("max_bytes") or 8192))
+        if tool == "net_if_list":
+            return self.net_if_list(int(args.get("timeout_ms") or 2000), int(args.get("max_output") or 65536))
+        if tool == "net_ensure_addr":
+            return self.net_ensure_addr(
+                args.get("iface", ""),
+                args.get("cidr", ""),
+                kind=str(args.get("kind") or "dummy"),
+                up=bool(args.get("up", True)),
+                timeout_ms=int(args.get("timeout_ms") or 5000),
+            )
+        if tool == "shell_run":
+            return self.shell_run(args.get("argv", []), int(args.get("timeout_ms") or 5000), int(args.get("max_output") or 65536))
+        return self._record("unknown_tool", False, {"tool": tool, "args": args}, {"error": "unknown_tool"}, False)
+
+
+def build_tools_spec(env: Dict[str, str], allow_write: bool, allow_shell: bool, allow_net: bool) -> List[Dict[str, Any]]:
+    """
+    OpenAI tools 规范（Chat Completions）。
+    """
+    tools: List[Dict[str, Any]] = []
+
+    def add(name: str, desc: str, props: Dict[str, Any], required: List[str]) -> None:
+        tools.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": {
+                        "type": "object",
+                        "properties": props,
+                        "required": required,
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        )
+
+    add(
+        "fs_read_text",
+        "读取固件 rootfs 内的文本文件（UTF-8 兜底替换），用于定位问题。只读。",
+        {"path": {"type": "string"}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}},
+        ["path"],
+    )
+    add(
+        "fs_read_bytes_b64",
+        "读取固件 rootfs 内的二进制文件并以 base64 返回（用于小体积证据采集）。只读。",
+        {
+            "path": {"type": "string"},
+            "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576},
+            "offset": {"type": "integer", "minimum": 0, "maximum": 1073741824},
+        },
+        ["path"],
+    )
+    add(
+        "fs_listdir",
+        "列出目录内容（用于定位 webroot/脚本/证书等）。只读。",
+        {"path": {"type": "string"}, "max_entries": {"type": "integer", "minimum": 1, "maximum": 2000}},
+        ["path"],
+    )
+    add(
+        "fs_glob",
+        "使用 glob(pattern) 查找文件（支持 ** 递归），结果会被 safe_root 过滤。只读。",
+        {"pattern": {"type": "string"}, "max_results": {"type": "integer", "minimum": 1, "maximum": 2000}},
+        ["pattern"],
+    )
+
+    if allow_write:
+        add(
+            "fs_mkdir_p",
+            "递归创建目录（等价 mkdir -p）。写入。",
+            {"path": {"type": "string"}, "mode": {"type": ["integer", "string", "null"]}},
+            ["path"],
+        )
+        add(
+            "fs_write_text",
+            "写入文本文件（可选创建父目录）。写入。",
+            {
+                "path": {"type": "string"},
+                "content": {"type": "string"},
+                "mode": {"type": ["integer", "string", "null"]},
+                "mkdirs": {"type": "boolean"},
+                "overwrite": {"type": "boolean"},
+            },
+            ["path", "content"],
+        )
+        add(
+            "fs_symlink",
+            "创建软链接（可 force 覆盖）。写入。",
+            {"target": {"type": "string"}, "link_path": {"type": "string"}, "force": {"type": "boolean"}},
+            ["target", "link_path"],
+        )
+        add(
+            "fs_copy",
+            "拷贝文件（可 overwrite 覆盖）。写入。",
+            {"src": {"type": "string"}, "dst": {"type": "string"}, "overwrite": {"type": "boolean"}},
+            ["src", "dst"],
+        )
+
+    add(
+        "http_get",
+        "对本机/私网地址发起 HTTP GET（用于验证 httpd 是否有回包/是否 404）。只读；禁止访问公网。",
+        {"url": {"type": "string"}, "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 10000}, "max_bytes": {"type": "integer", "minimum": 1, "maximum": 1048576}},
+        ["url"],
+    )
+
+    if allow_net:
+        add(
+            "net_if_list",
+            "查看当前网络接口与地址（优先使用 ip -j）。只读。",
+            {"timeout_ms": {"type": "integer", "minimum": 100, "maximum": 60000}, "max_output": {"type": "integer", "minimum": 1, "maximum": 1048576}},
+            [],
+        )
+        add(
+            "net_ensure_addr",
+            "通用网络补齐：确保 iface 存在（必要时创建 dummy/bridge）、置 up，并确保其上存在指定 IPv4 CIDR（如 192.168.1.1/24）。写入/有副作用。",
+            {
+                "iface": {"type": "string"},
+                "cidr": {"type": "string"},
+                "kind": {"type": "string", "enum": ["dummy", "bridge"]},
+                "up": {"type": "boolean"},
+                "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 60000},
+            },
+            ["iface", "cidr"],
+        )
+
+    if allow_shell:
+        add(
+            "shell_run",
+            "在当前环境执行白名单命令（默认关闭，需显式启用）。写入/有副作用，谨慎使用。",
+            {
+                "argv": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 64},
+                "timeout_ms": {"type": "integer", "minimum": 100, "maximum": 60000},
+                "max_output": {"type": "integer", "minimum": 1, "maximum": 1048576},
+            },
+            ["argv"],
+        )
+
+    return tools
+
+
 def read_text_if_exists(path: str, max_bytes: int = 64 * 1024) -> str:
     try:
         with open(path, "rb") as f:
@@ -153,7 +896,8 @@ def build_prompt(snapshot: Dict[str, Any], run_dir: str, env: Dict[str, str]) ->
         "你是一个资深的二进制仿真/系统调用兼容性工程师。\n"
         "推理强度（Reasoning effort）：Extra high。\n"
         "我会给你一份仿真失败时的上下文快照（寄存器、调用栈、近期 syscall 序列、内存证据）。\n"
-        "你的任务是：生成最小、可回滚、尽量精确命中的 Lua syscall 规则，用于修复仿真失败并让固件继续运行。\n"
+        "你的任务是：优先用“最小环境干预（actions/tools）”让固件继续运行并把 http 服务跑起来；\n"
+        "只有当无法通过环境补齐解决时，才生成最小、可回滚、尽量精确命中的 Lua syscall 规则。\n"
         "\n"
         "规则接口约定：\n"
         "- 文件位置：syscall/<name>.lua\n"
@@ -168,8 +912,20 @@ def build_prompt(snapshot: Dict[str, Any], run_dir: str, env: Dict[str, str]) ->
         "{\n"
         "  \"fix\": { \"syscall/<name>.lua\": \"<lua source>\" },\n"
         "  \"observe\": { \"syscall/<name>.lua\": \"<lua source>\" },\n"
-        "  \"explain\": \"简要说明为什么这么改，以及风险/回滚点\"\n"
+        "  \"explain\": \"简要说明为什么这么改，以及风险/回滚点\",\n"
+        "  \"actions\": [\n"
+        "    {\"tool\": \"fs_mkdir_p\", \"args\": {\"path\": \"/var/run\", \"mode\": \"0755\"}},\n"
+        "    {\"tool\": \"fs_write_text\", \"args\": {\"path\": \"/etc/TZ\", \"content\": \"UTC\\n\", \"overwrite\": false}}\n"
+        "  ]\n"
         "}\n"
+        "\n"
+        "actions 说明：\n"
+        "- 可选字段，用于做“轻量 filesystem 干预”（补目录/补文件/建软链/拷贝等），以减少为每个固件手写规则。\n"
+        "- 若 reason 是 sleep_loop/deadloop：优先检查网络与 webroot：\n"
+        "  1) 用 net_if_list 查看接口；若缺 br0 或缺 192.168.1.1/24，可用 net_ensure_addr 补齐（先 bridge，失败再 dummy，或改用 eth0）。\n"
+        "  2) 用 http_get 验证 127.0.0.1/192.168.1.1/172.17.* 是否有回包。\n"
+        "- 若当前执行器支持 tools/tool_calls，你也可以直接调用工具来读取/修改 rootfs，并在最后输出 JSON。\n"
+        "- 只做最小必要修改；尽量幂等（重复执行不会破坏环境）。\n"
         "\n"
         "注意：\n"
         "- 不要硬编码绝对路径；尽量用参数+少量上下文特征（如 sockaddr 内容/固定 fd/关键参数）精确命中。\n"
@@ -305,7 +1061,35 @@ def build_prompt(snapshot: Dict[str, Any], run_dir: str, env: Dict[str, str]) ->
     return system_prompt, user_prompt
 
 
-def call_openai_chat(env: Dict[str, str], system_prompt: str, user_prompt: str) -> str:
+def _openai_do_request(base_url: str, api_key: str, payload: Dict[str, Any], env: Dict[str, str]) -> bytes:
+    req = urllib.request.Request(
+        base_url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}",
+        },
+    )
+    ctx = None
+    cafile = None
+    try:
+        cafile = pick_ca_bundle(env)
+    except Exception:
+        cafile = None
+    try:
+        if cafile:
+            ctx = ssl.create_default_context(cafile=cafile)
+        else:
+            ctx = ssl.create_default_context()
+    except Exception:
+        ctx = None
+
+    with urllib.request.urlopen(req, timeout=120, context=ctx) as resp:
+        return resp.read()
+
+
+def call_openai_chat_raw(env: Dict[str, str], messages: List[Dict[str, Any]], tools: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     api_key = env.get("OPENAI_API_KEY") or env.get("OPENAI_KEY") or ""
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY 未设置")
@@ -313,47 +1097,146 @@ def call_openai_chat(env: Dict[str, str], system_prompt: str, user_prompt: str) 
     model = env.get("OPENAI_MODEL") or "gpt-4o-mini"
     base_url = normalize_chat_completions_url(env.get("OPENAI_BASE_URL") or env.get("OPENAI_BASEURL") or "")
 
-    payload = {
+    payload: Dict[str, Any] = {
         "model": model,
         "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
+        "messages": messages,
     }
-
-    def do_request(p: Dict[str, Any]) -> bytes:
-        req = urllib.request.Request(
-            base_url,
-            data=json.dumps(p).encode("utf-8"),
-            method="POST",
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}",
-            },
-        )
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            return resp.read()
 
     # 尽量启用 JSON mode（OpenAI/Gateway 常支持 response_format=json_object），强制模型输出 JSON，避免解析失败。
     # 兼容性：若网关不支持该字段，回退到普通模式。
     json_mode = env.get("OPENAI_JSON_MODE") or env.get("SFEMU_AI_JSON_MODE")
     json_mode_on = json_mode is None or str(json_mode).strip().lower() in ("1", "true", "yes", "y", "on")
-    data = b""
+    if tools:
+        payload["tools"] = tools
+        # 默认 auto：让模型自行决定是否调用工具
+        payload["tool_choice"] = "auto"
+
+    # 兼容策略：依次尝试
+    # 1) tools + response_format（若开启 JSON mode）
+    # 2) tools（不带 response_format）
+    # 3) 无 tools（带 response_format）
+    # 4) 无 tools（不带 response_format）
+    attempts: List[Dict[str, Any]] = []
     if json_mode_on:
-        payload_json = dict(payload)
-        payload_json["response_format"] = {"type": "json_object"}
+        p1 = dict(payload)
+        p1["response_format"] = {"type": "json_object"}
+        attempts.append(p1)
+    attempts.append(dict(payload))
+
+    if tools:
+        # 无 tools 的尝试（保底）
+        payload_no_tools = dict(payload)
+        payload_no_tools.pop("tools", None)
+        payload_no_tools.pop("tool_choice", None)
+        if json_mode_on:
+            p3 = dict(payload_no_tools)
+            p3["response_format"] = {"type": "json_object"}
+            attempts.append(p3)
+        attempts.append(payload_no_tools)
+
+    last_http_err: Optional[urllib.error.HTTPError] = None
+    last_body = ""
+    for p in attempts:
         try:
-            data = do_request(payload_json)
+            data = _openai_do_request(base_url, api_key, p, env)
+            return json.loads(data.decode("utf-8", errors="replace"))
         except urllib.error.HTTPError as ex:
-            body = ex.read().decode("utf-8", errors="replace") if hasattr(ex, "read") else ""
-            # 常见不支持表现：unknown field/extra inputs/response_format not permitted 等
-            if ex.code in (400, 404) and ("response_format" in body or "unknown" in body.lower() or "extra" in body.lower()):
-                data = do_request(payload)
-            else:
-                raise
-    else:
-        data = do_request(payload)
+            last_http_err = ex
+            try:
+                last_body = ex.read().decode("utf-8", errors="replace") if hasattr(ex, "read") else ""
+            except Exception:
+                last_body = ""
+            # 常见兼容失败：unknown field/extra inputs/response_format not permitted 等
+            if ex.code in (400, 404):
+                continue
+            raise
+
+    if last_http_err is not None:
+        raise RuntimeError(f"OpenAI API HTTPError: code={last_http_err.code} msg={last_http_err.msg} body={last_body[:2000]}")
+    raise RuntimeError("OpenAI API 调用失败：无可用尝试（无 HTTPError）")
+
+
+def extract_message(resp_obj: Dict[str, Any]) -> Dict[str, Any]:
+    msg = ((resp_obj.get("choices") or [{}])[0].get("message") or {})  # type: ignore[union-attr]
+    if not isinstance(msg, dict):
+        return {}
+    return msg
+
+
+def run_openai_agent(env: Dict[str, str], system_prompt: str, user_prompt: str, runner: ActionRunner, tools: Optional[List[Dict[str, Any]]]) -> str:
+    """
+    支持 tool_calls 的多轮对话：模型可读取/修改 rootfs，再输出最终 JSON。
+    """
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+
+    max_steps = clamp_int(env.get("SFEMU_AI_MCP_MAX_TOOL_STEPS"), 0, 64, 8)
+    # tools 为空则退化为单轮
+    if not tools or max_steps == 0:
+        resp = call_openai_chat_raw(env, messages, tools=None)
+        msg = extract_message(resp)
+        return str(msg.get("content") or "")
+
+    for _ in range(max_steps):
+        resp = call_openai_chat_raw(env, messages, tools=tools)
+        msg = extract_message(resp)
+
+        tool_calls = msg.get("tool_calls")
+        if isinstance(tool_calls, list) and tool_calls:
+            # 先把 assistant/tool_calls 消息放回历史
+            messages.append(msg)
+            for tc in tool_calls:
+                try:
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_id = tc.get("id") or ""
+                    fn = tc.get("function") or {}
+                    name = (fn.get("name") if isinstance(fn, dict) else None) or ""
+                    arg_str = (fn.get("arguments") if isinstance(fn, dict) else None) or "{}"
+                    try:
+                        args = json.loads(arg_str) if isinstance(arg_str, str) and arg_str.strip() else {}
+                    except Exception:
+                        args = {"_raw": str(arg_str)}
+                    result = runner.run_action(str(name), args if isinstance(args, dict) else {"_": args})
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str(tc_id),
+                            "content": json.dumps(result, ensure_ascii=False),
+                        }
+                    )
+                except Exception as ex:
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": str((tc or {}).get("id") or ""),
+                            "content": json.dumps({"ok": False, "error": str(ex)}, ensure_ascii=False),
+                        }
+                    )
+            continue
+
+        # 兼容旧式 function_call（极少数网关）
+        fn_call = msg.get("function_call")
+        if isinstance(fn_call, dict) and fn_call.get("name"):
+            messages.append(msg)
+            name = str(fn_call.get("name") or "")
+            arg_str = str(fn_call.get("arguments") or "{}")
+            try:
+                args = json.loads(arg_str) if arg_str.strip() else {}
+            except Exception:
+                args = {"_raw": arg_str}
+            result = runner.run_action(name, args if isinstance(args, dict) else {"_": args})
+            messages.append({"role": "function", "name": name, "content": json.dumps(result, ensure_ascii=False)})
+            continue
+
+        # 无工具调用：视为最终回复
+        return str(msg.get("content") or "")
+
+    # 超过最大步数：返回最后一条内容（可能为空）
+    return str((messages[-1] or {}).get("content") or "")
 
     obj = json.loads(data.decode("utf-8", errors="replace"))
     content = (
@@ -930,6 +1813,30 @@ def write_rule_files(patch_dir: str, obj: Dict[str, Any]) -> None:
         f.write("\n")
 
 
+def write_actions_files(patch_dir: str, runner: ActionRunner) -> None:
+    try:
+        with open(os.path.join(patch_dir, "ai_actions.json"), "w", encoding="utf-8") as f:
+            json.dump(
+                {
+                    "mutations_applied": runner.mutations_applied,
+                    "actions": runner.actions,
+                },
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+            f.write("\n")
+    except Exception:
+        pass
+
+    # 给 Lua 侧一个“无需 JSON 解析”的最小信号：本轮是否执行了写入类动作
+    try:
+        with open(os.path.join(patch_dir, "ai_actions_applied.txt"), "w", encoding="utf-8") as f:
+            f.write(str(int(runner.mutations_applied)) + "\n")
+    except Exception:
+        pass
+
+
 def main(argv: list[str]) -> int:
     if len(argv) != 4:
         eprint("usage: ai_mcp_openai.py <snapshot.json> <rules_patch_dir> <env_path>")
@@ -965,8 +1872,250 @@ def main(argv: list[str]) -> int:
 
     system_prompt, user_prompt = build_prompt(snapshot, run_dir, env)
 
+    # actions/tool_calls：默认关闭，避免误写宿主机；需要时在 env 中显式开启。
+    safe_root = env.get("SFEMU_AI_MCP_SAFE_ROOT") or env.get("SFEMU_AI_SAFE_ROOT") or ""
+    safe_root = safe_root.strip() or (detect_safe_root(run_dir) or "")
+
+    tools_enable = str_bool(env.get("SFEMU_AI_MCP_TOOLS_ENABLE") or env.get("SFEMU_AI_MCP_TOOLS"), False)
+    actions_enable = str_bool(env.get("SFEMU_AI_MCP_ACTIONS_ENABLE") or env.get("SFEMU_AI_MCP_ACTIONS"), False)
+    shell_enable = str_bool(env.get("SFEMU_AI_MCP_SHELL_ENABLE"), False)
+    net_enable = str_bool(env.get("SFEMU_AI_MCP_NET_ENABLE") or env.get("SFEMU_AI_MCP_NET"), False)
+    ip_bin = env.get("SFEMU_AI_MCP_IP_BIN") or ""
+    assume_container = str_bool(env.get("SFEMU_AI_MCP_ASSUME_CONTAINER") or env.get("SFEMU_AI_MCP_NET_ASSUME_CONTAINER"), False)
+
+    runner = ActionRunner(
+        safe_root if safe_root else None,
+        allow_write=actions_enable,
+        allow_shell=shell_enable,
+        allow_net=net_enable,
+        ip_bin=ip_bin,
+        assume_container=assume_container,
+    )
+    tools_spec = build_tools_spec(env, allow_write=actions_enable, allow_shell=shell_enable, allow_net=net_enable) if tools_enable else None
+
+    # ----------------------------
+    # 轻量自愈（不依赖外部 API）
+    # ----------------------------
+    # sleep_loop 常见根因是“等待网络/桥接接口/LAN IP”，若依赖 LLM 生成规则不仅慢且不稳定。
+    # 这里提供一个默认开启的、自包含的 playbook：
+    # - 尝试补齐 br0/eth0 的 LAN IP（默认 192.168.1.1/24）
+    # - 将 select/pselect6 的超长 timeout 缩短到 200ms（只改内存，不拦截返回值），让状态机更快重新评估条件
+    #
+    # 可通过 env 关闭：SFEMU_AI_MCP_AUTOFIX_SLEEP_LOOP=0
     try:
-        content = call_openai_chat(env, system_prompt, user_prompt)
+        autofix_on = str_bool(env.get("SFEMU_AI_MCP_AUTOFIX_SLEEP_LOOP"), True)
+    except Exception:
+        autofix_on = True
+
+    if autofix_on and (snapshot.get("reason") == "sleep_loop"):
+        lan_cidr = (env.get("SFEMU_AI_LAN_CIDR") or "192.168.1.1/24").strip()
+        lan_if = (env.get("SFEMU_AI_LAN_IFACE") or "br0").strip() or "br0"
+
+        # 1) 网络补齐（可选）
+        if net_enable:
+            runner.net_if_list()
+            # 先试 bridge，再退化 dummy；最后再尝试在 eth0 上加地址（避免 br0 创建失败导致完全无效）
+            r1 = runner.net_ensure_addr(lan_if, lan_cidr, kind="bridge", up=True)
+            if not (isinstance(r1, dict) and r1.get("ok") is True):
+                runner.net_ensure_addr(lan_if, lan_cidr, kind="dummy", up=True)
+            runner.net_ensure_addr("eth0", lan_cidr, kind="dummy", up=True)
+
+        # 2) 生成“缩短 sleep”的通用规则（尽量不拦截，只改 timeout 结构体）
+        # 说明：该规则用于加速固件状态机推进，避免每轮 sleep 60s 导致 Docker wait 超时。
+        fix_select = r"""
+-- select.lua (autofix) - 将 nfds=0 的长/无 timeout 缩短为 200ms，避免固件在 sleep_loop 中卡住
+
+local SYSCALL_SELECT = 142
+local SYSCALL_MMAP2 = 192
+
+local PROT_READ = 0x1
+local PROT_WRITE = 0x2
+local MAP_PRIVATE = 0x2
+local MAP_ANONYMOUS = 0x20
+
+local g_scratch = 0
+
+local function u32_le(x)
+  x = tonumber(x) or 0
+  x = x & 0xffffffff
+  return string.char(x & 0xff, (x >> 8) & 0xff, (x >> 16) & 0xff, (x >> 24) & 0xff)
+end
+
+local function get_scratch()
+  if g_scratch ~= 0 then
+    return g_scratch
+  end
+  if type(c_do_syscall) ~= "function" or type(c_write_bytes) ~= "function" then
+    return 0
+  end
+  local addr = 0
+  local length = 4096
+  local prot = PROT_READ | PROT_WRITE
+  local flags = MAP_PRIVATE | MAP_ANONYMOUS
+  local fd = -1
+  local off = 0
+  local ret = c_do_syscall(SYSCALL_MMAP2, addr, length, prot, flags, fd, off, 0, 0)
+  if type(ret) == "number" and ret > 0 then
+    g_scratch = ret
+  end
+  return g_scratch
+end
+
+local function patch_timeval(ptr, tv_sec, tv_usec)
+  ptr = tonumber(ptr) or 0
+  if ptr == 0 or type(c_write_bytes) ~= "function" then
+    return false
+  end
+  local data = u32_le(tv_sec) .. u32_le(tv_usec)
+  local _, rc = c_write_bytes(ptr, data)
+  return rc == 0
+end
+
+function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+  if tonumber(num) ~= SYSCALL_SELECT then
+    return 0, 0
+  end
+
+  local nfds = tonumber(arg1) or -1
+  local readfds = arg2
+  local writefds = arg3
+  local exceptfds = arg4
+  local timeout = tonumber(arg5) or 0
+
+  if nfds ~= 0 then
+    return 0, 0
+  end
+
+  -- 1) 有 timeout：直接把 timeval 改小，再放行真实 syscall
+  if timeout ~= 0 then
+    patch_timeval(timeout, 0, 200000)
+    return 0, 0
+  end
+
+  -- 2) timeout==NULL（无限阻塞）：用 scratch timeval 执行一次“带 200ms timeout 的真实 select”
+  local tv = get_scratch()
+  if tv ~= 0 then
+    patch_timeval(tv, 0, 200000)
+    local r = c_do_syscall(SYSCALL_SELECT, nfds, readfds, writefds, exceptfds, tv, 0, 0, 0)
+    return 1, r
+  end
+
+  -- 兜底：直接返回 0（可能导致 busy loop，但至少不会永久卡死）
+  return 1, 0
+end
+""".lstrip("\n")
+
+        fix_pselect6 = r"""
+-- pselect6.lua (autofix) - 将 nfds=0 的长/无 timeout 缩短为 200ms，避免固件在 sleep_loop 中卡住
+
+local SYSCALL_PSELECT6 = 335
+local SYSCALL_MMAP2 = 192
+
+local PROT_READ = 0x1
+local PROT_WRITE = 0x2
+local MAP_PRIVATE = 0x2
+local MAP_ANONYMOUS = 0x20
+
+local g_scratch = 0
+
+local function u32_le(x)
+  x = tonumber(x) or 0
+  x = x & 0xffffffff
+  return string.char(x & 0xff, (x >> 8) & 0xff, (x >> 16) & 0xff, (x >> 24) & 0xff)
+end
+
+local function get_scratch()
+  if g_scratch ~= 0 then
+    return g_scratch
+  end
+  if type(c_do_syscall) ~= "function" or type(c_write_bytes) ~= "function" then
+    return 0
+  end
+  local addr = 0
+  local length = 4096
+  local prot = PROT_READ | PROT_WRITE
+  local flags = MAP_PRIVATE | MAP_ANONYMOUS
+  local fd = -1
+  local off = 0
+  local ret = c_do_syscall(SYSCALL_MMAP2, addr, length, prot, flags, fd, off, 0, 0)
+  if type(ret) == "number" and ret > 0 then
+    g_scratch = ret
+  end
+  return g_scratch
+end
+
+local function patch_timespec(ptr, tv_sec, tv_nsec)
+  ptr = tonumber(ptr) or 0
+  if ptr == 0 or type(c_write_bytes) ~= "function" then
+    return false
+  end
+  local data = u32_le(tv_sec) .. u32_le(tv_nsec)
+  local _, rc = c_write_bytes(ptr, data)
+  return rc == 0
+end
+
+function do_syscall(num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
+  if tonumber(num) ~= SYSCALL_PSELECT6 then
+    return 0, 0
+  end
+
+  local nfds = tonumber(arg1) or -1
+  local readfds = arg2
+  local writefds = arg3
+  local exceptfds = arg4
+  local timeout = tonumber(arg5) or 0
+  local sigmask = arg6
+  local extra7 = arg7
+  local extra8 = arg8
+
+  if nfds ~= 0 then
+    return 0, 0
+  end
+
+  if timeout ~= 0 then
+    patch_timespec(timeout, 0, 200000000)
+    return 0, 0
+  end
+
+  local ts = get_scratch()
+  if ts ~= 0 then
+    patch_timespec(ts, 0, 200000000)
+    local r = c_do_syscall(SYSCALL_PSELECT6, nfds, readfds, writefds, exceptfds, ts, sigmask, extra7, extra8)
+    return 1, r
+  end
+
+  return 1, 0
+end
+""".lstrip("\n")
+
+        obj = {
+            "fix": {
+                "syscall/select.lua": fix_select,
+                "syscall/pselect6.lua": fix_pselect6,
+            },
+            "observe": {},
+            "explain": (
+                "sleep_loop 自愈：\n"
+                "- (可选) 补齐 LAN IP：{iface} -> {cidr}（优先 bridge，失败退化 dummy；同时尝试 eth0）。\n"
+                "- 缩短 select/pselect6(nfds=0) 的 timeout 到 200ms：\n"
+                "  - 若 timeout 非空：仅改 timeout 结构体后放行；\n"
+                "  - 若 timeout==NULL：用 scratch timeval/timespec 执行一次“带 200ms timeout 的真实 syscall”（需要拦截一次以返回结果）。\n"
+                "\n"
+                "风险：可能让固件轮询频率升高；但相比 60s 级 sleep 更利于在批量实验窗口内推进状态机。\n"
+                "回滚：删除 syscall_override/select.lua 与 syscall_override/pselect6.lua（或关闭 SFEMU_AI_MCP_AUTOFIX_SLEEP_LOOP）。\n"
+            ).format(iface=lan_if, cidr=lan_cidr),
+        }
+
+        try:
+            write_rule_files(patch_dir, obj)
+            write_actions_files(patch_dir, runner)
+        except Exception as ex:
+            eprint(f"[ai_mcp_openai] autofix_sleep_loop 写入失败: {ex}")
+            return 6
+        return 0
+
+    try:
+        content = run_openai_agent(env, system_prompt, user_prompt, runner, tools_spec)
     except urllib.error.HTTPError as ex:
         body = ex.read().decode("utf-8", errors="replace") if hasattr(ex, "read") else ""
         eprint(f"[ai_mcp_openai] HTTPError: {ex} body={body[:2000]}")
@@ -979,6 +2128,7 @@ def main(argv: list[str]) -> int:
             return 4
         try:
             write_rule_files(patch_dir, fallback)
+            write_actions_files(patch_dir, runner)
         except Exception as ex2:
             eprint(f"[ai_mcp_openai] 写规则失败: {ex2}")
             return 6
@@ -1018,6 +2168,17 @@ def main(argv: list[str]) -> int:
 
     try:
         write_rule_files(patch_dir, obj)
+        # 允许模型在最终 JSON 中额外返回 actions（当网关不支持 tool_calls 时尤其有用）
+        acts = obj.get("actions")
+        if actions_enable and isinstance(acts, list):
+            for it in acts:
+                if not isinstance(it, dict):
+                    continue
+                tool = it.get("tool") or it.get("name")
+                args = it.get("args") if isinstance(it.get("args"), dict) else {}
+                if tool:
+                    runner.run_action(str(tool), args)
+        write_actions_files(patch_dir, runner)
     except Exception as ex:
         eprint(f"[ai_mcp_openai] 写规则失败: {ex}")
         return 6

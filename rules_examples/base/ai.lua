@@ -824,7 +824,16 @@ function M.handle(ctx, entry_state, meta)
         if mcp_on and (type(cfg.ai_cmd) ~= "string" or cfg.ai_cmd == "") then
             local py = rawget(_G, "SFEMU_AI_MCP_PY")
             if type(py) ~= "string" or py == "" then
-                py = "python3"
+                -- 重要：固件 chroot 环境里 PATH 往往不包含 /usr/bin，直接调用 "python3" 会得到 exit=127。
+                -- 但批量脚本会把宿主（容器）的 x86_64 python3 bind mount 到 rootfs 的 /usr/bin/python3。
+                -- 因此这里优先使用绝对路径，确保无需依赖 PATH。
+                local f = io.open("/usr/bin/python3", "rb")
+                if f then
+                    f:close()
+                    py = "/usr/bin/python3"
+                else
+                    py = "python3"
+                end
             end
             local script = rawget(_G, "SFEMU_AI_MCP_SCRIPT")
             if type(script) ~= "string" or script == "" then
@@ -1106,6 +1115,23 @@ function M.handle(ctx, entry_state, meta)
         end
     end
 
+    -- 外部工具（AI MCP）可能会在本轮执行“文件系统干预动作”（例如补目录/补证书/建软链），
+    -- 这类动作不一定会产出 Lua 规则文件，但在 exit 场景下同样需要触发 re-exec 才能验证是否生效。
+    --
+    -- 约定：外部工具可在 rules_patch/ 下写入 `ai_actions_applied.txt`（内容为整数，表示写入类动作数量）。
+    local applied_actions_count = 0
+    do
+        local ap = patch_dir .. "/ai_actions_applied.txt"
+        local data = read_file(ap)
+        if type(data) == "string" and data ~= "" then
+            local n = tonumber(data:match("(%d+)")) or 0
+            if n and n > 0 then
+                applied_actions_count = n
+                append_file(retry_log_path, string.format("actions_applied: %d\n", n))
+            end
+        end
+    end
+
     -- E) 自动重试与评估（闭环）：进入“验证窗口”，通过后导出稳定规则
     --
     -- 说明：
@@ -1146,6 +1172,7 @@ function M.handle(ctx, entry_state, meta)
         generated = generated,
         applied_syscalls = applied,
         applied_fix_syscalls = applied_fix,
+        applied_actions_count = applied_actions_count,
         stable_root = stable_root,
         -- 自动继续：
         -- - SFEMU_AI_AUTO_CONTINUE=1：无论本轮是否产出修复，都继续运行（避免无人值守时卡在提示）

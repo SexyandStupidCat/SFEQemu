@@ -20,12 +20,17 @@ end
 --
 -- 说明：这些号以 ARM EABI 为准（与本项目已有日志一致：socket=281, connect=283, openat=322）。
 local SYSCALL_NUM_TO_NAME = {
+    -- ARM EABI: execve=11 / execveat=387（仅观测）
+    [11] = "execve",
+    [387] = "execveat",
     [289] = "send",
     [290] = "sendto",
     [291] = "recv",
     [292] = "recvfrom",
     [296] = "sendmsg",
     [297] = "recvmsg",
+    -- ARM EABI: _newselect=142（避免 name 缺失时日志显示为 sys_142）
+    [142] = "select",
 }
 
 function finish(syscall_name, num, ret, intercepted, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8)

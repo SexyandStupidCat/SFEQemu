@@ -29,6 +29,18 @@ FORCE_SDGEN="${FORCE_SDGEN:-0}"
 FORCE_SFANALYSIS="${FORCE_SFANALYSIS:-0}"
 FORCE_DOCKER="${FORCE_DOCKER:-1}"
 
+# AI/MCP（可选）：默认保持关闭，避免批量实验意外消耗 token 或误改文件系统。
+# 如需启用（并允许 AI 做 filesystem 干预），示例：
+#   AI_MCP_ENABLE=1 AI_MCP_TOOLS_ENABLE=1 AI_MCP_ACTIONS_ENABLE=1 \
+#     ./lab/run_batch_001.sh lab/batch_001_asus_arm_httpd.txt
+AI_ENABLE="${AI_ENABLE:-0}"
+AI_MCP_ENABLE="${AI_MCP_ENABLE:-0}"
+AI_MCP_TOOLS_ENABLE="${AI_MCP_TOOLS_ENABLE:-0}"
+AI_MCP_ACTIONS_ENABLE="${AI_MCP_ACTIONS_ENABLE:-0}"
+AI_MCP_SHELL_ENABLE="${AI_MCP_SHELL_ENABLE:-0}"
+AI_MCP_NET_ENABLE="${AI_MCP_NET_ENABLE:-0}"
+DOCKER_WAIT_SECS="${DOCKER_WAIT_SECS:-90}"
+
 # Docker 行为控制（默认保持“批量脚本跑完即退出”的语义）
 #
 # 背景：批量脚本的 Docker 步骤会在 curl 验证成功后立刻退出容器并清理 qemu-arm，
@@ -97,11 +109,28 @@ run_one() {
   mkdir -p "${rootfs}/rules_examples/syscall_override_user"
   mkdir -p "${rootfs}/rules_examples/config"
 
-  # env：无人值守（避免卡住等待 YES），且默认不启用外部 AI（需要时可手工打开）
-  cat >"${rootfs}/rules_examples/config/env" <<'EOF'
-# 自动注入：批量仿真默认配置（可按固件覆盖）
-SFEMU_AI_ENABLE=0
-SFEMU_AI_MCP_ENABLE=0
+  # env：优先继承仓库内的 config/env（包含 OPENAI_* 等本地配置），再追加批量实验开关（覆盖同名键）。
+  # 说明：
+  # - 直接覆盖写死 env 会丢失 OPENAI_API_KEY，导致 AI MCP 无法调用；
+  # - 这里采用“copy + append override”的方式，确保可控且可追溯。
+  if [[ -f "${RULES_SRC}/config/env" ]]; then
+    cp -f "${RULES_SRC}/config/env" "${rootfs}/rules_examples/config/env"
+  else
+    : >"${rootfs}/rules_examples/config/env"
+  fi
+  cat >>"${rootfs}/rules_examples/config/env" <<EOF
+
+# ----------------------------
+# 自动注入：批量仿真覆盖配置（可按固件覆盖）
+# ----------------------------
+SFEMU_AI_ENABLE=${AI_ENABLE}
+SFEMU_AI_MCP_ENABLE=${AI_MCP_ENABLE}
+SFEMU_AI_MCP_TOOLS_ENABLE=${AI_MCP_TOOLS_ENABLE}
+SFEMU_AI_MCP_ACTIONS_ENABLE=${AI_MCP_ACTIONS_ENABLE}
+SFEMU_AI_MCP_SHELL_ENABLE=${AI_MCP_SHELL_ENABLE}
+SFEMU_AI_MCP_NET_ENABLE=${AI_MCP_NET_ENABLE}
+SFEMU_AI_MCP_IP_BIN=/sfemu_tools/ip
+SFEMU_AI_MCP_ASSUME_CONTAINER=1
 SFEMU_AI_AUTO_CONTINUE=1
 SFEMU_AI_APPLY_RULES=1
 SFEMU_AI_APPLY_OBSERVE=0
@@ -214,6 +243,7 @@ EOF
       HOST_HTTP_PORT=\"${HOST_HTTP_PORT}\"
       HOST_HTTPS_PORT=\"${HOST_HTTPS_PORT}\"
       CONTAINER_NAME=\"${container_name}\"
+      WAIT_SECS=\"${DOCKER_WAIT_SECS}\"
 
       mkdir -p /rootfs/sfemu_lab
       date -Is > /rootfs/sfemu_lab/docker.started_at
@@ -248,6 +278,60 @@ EOF
       cp -f /etc/nsswitch.conf \"\${ROOT}/tmp/etc/nsswitch.conf\" 2>/dev/null || true
       cp -f /etc/ssl/certs/ca-certificates.crt \"\${ROOT}/tmp/etc/ssl/certs/ca-certificates.crt\" 2>/dev/null || true
 
+      # ---- AI MCP 依赖（x86_64 python3 + 动态库）----
+      # 背景：qemu-arm 在 chroot(rootfs) 内运行时，固件一般不自带 python3；
+      # 但 AI MCP 插件（ai_mcp_openai.py）需要 python3（x86_64）访问 OpenAI 兼容 API。
+      # 方案：把容器内的 x86_64 python3 及其运行时目录“只读 bind mount”进 rootfs 的非冲突路径：
+      # - /usr/bin/python3（文件级 bind mount）
+      # - /lib64 /lib/x86_64-linux-gnu /usr/lib/x86_64-linux-gnu（目录 bind mount）
+      # - /usr/lib/pythonX.Y /usr/lib/python3（标准库）
+      need_ai=0
+      if grep -qs '^SFEMU_AI_MCP_ENABLE=1' \"\${ROOT}/rules_examples/config/env\"; then need_ai=1; fi
+      if grep -qs '^SFEMU_AI_ENABLE=1' \"\${ROOT}/rules_examples/config/env\"; then need_ai=1; fi
+      if [[ \"\${need_ai}\" == \"1\" ]]; then
+        mkdir -p \"\${ROOT}/usr/bin\" \"\${ROOT}/usr/lib\" \"\${ROOT}/lib\" \"\${ROOT}/lib64\" 2>/dev/null || true
+        # python3 binary
+        if [[ -x /usr/bin/python3 ]]; then
+          if [[ ! -e \"\${ROOT}/usr/bin/python3\" ]]; then
+            : >\"\${ROOT}/usr/bin/python3\" 2>/dev/null || true
+            chmod +x \"\${ROOT}/usr/bin/python3\" 2>/dev/null || true
+          fi
+          mount --bind /usr/bin/python3 \"\${ROOT}/usr/bin/python3\" 2>/dev/null || true
+        fi
+        # dynamic loader + glibc
+        if [[ -d /lib64 ]]; then
+          mkdir -p \"\${ROOT}/lib64\" 2>/dev/null || true
+          mount --bind /lib64 \"\${ROOT}/lib64\" 2>/dev/null || true
+        fi
+        if [[ -d /lib/x86_64-linux-gnu ]]; then
+          mkdir -p \"\${ROOT}/lib/x86_64-linux-gnu\" 2>/dev/null || true
+          mount --bind /lib/x86_64-linux-gnu \"\${ROOT}/lib/x86_64-linux-gnu\" 2>/dev/null || true
+        fi
+        if [[ -d /usr/lib/x86_64-linux-gnu ]]; then
+          mkdir -p \"\${ROOT}/usr/lib/x86_64-linux-gnu\" 2>/dev/null || true
+          mount --bind /usr/lib/x86_64-linux-gnu \"\${ROOT}/usr/lib/x86_64-linux-gnu\" 2>/dev/null || true
+        fi
+        # python stdlib（ubuntu:24.04 默认 python3.12；若未来版本变更，可按需扩展）
+        if [[ -d /usr/lib/python3.12 ]]; then
+          mkdir -p \"\${ROOT}/usr/lib/python3.12\" 2>/dev/null || true
+          mount --bind /usr/lib/python3.12 \"\${ROOT}/usr/lib/python3.12\" 2>/dev/null || true
+        fi
+        if [[ -d /usr/lib/python3 ]]; then
+          mkdir -p \"\${ROOT}/usr/lib/python3\" 2>/dev/null || true
+          mount --bind /usr/lib/python3 \"\${ROOT}/usr/lib/python3\" 2>/dev/null || true
+        fi
+
+        # iproute2（供 AI MCP net_* 工具使用）：避免依赖固件自带 ip/ifconfig
+        mkdir -p \"\${ROOT}/sfemu_tools\" 2>/dev/null || true
+        if [[ -x /usr/sbin/ip ]]; then
+          if [[ ! -e \"\${ROOT}/sfemu_tools/ip\" ]]; then
+            : >\"\${ROOT}/sfemu_tools/ip\" 2>/dev/null || true
+            chmod +x \"\${ROOT}/sfemu_tools/ip\" 2>/dev/null || true
+          fi
+          mount --bind /usr/sbin/ip \"\${ROOT}/sfemu_tools/ip\" 2>/dev/null || true
+        fi
+      fi
+
       # 后台启动 qemu-user(httpd)
       qpid=\"\"
       cleanup() {
@@ -268,8 +352,9 @@ EOF
       echo \"\$qpid\" > /rootfs/sfemu_lab/chroot.pid
 
       # 等待服务启动：优先扫描 qemu-arm 监听端口；否则回退常见端口 80/443/8080
-      detect_ports() {
-        ss -lntpH 2>/dev/null | awk '/qemu-arm/ {print \$4}' | sed 's/.*://g' | tr -d '[]' | sort -n | uniq
+      detect_listeners() {
+        # 输出：addr port（空格分隔）。过滤掉 0.0.0.0/:: 时，后续会回退到 127.0.0.1。
+        ss -lntpH 2>/dev/null | awk '{print \$4}' | sed 's/\\[//g; s/\\]//g' | awk -F: 'NF>=2 {port=\$NF; \$NF=\"\"; addr=\$0; sub(/:$/, \"\", addr); print addr\" \"port}' | sort -u
       }
 
       try_curl() {
@@ -293,17 +378,31 @@ EOF
       }
 
       ok=0
-      for i in \$(seq 1 90); do
-        ports=\"\$(detect_ports | tr '\\n' ' ')\"
+      for i in \$(seq 1 \"\${WAIT_SECS}\"); do
+        # 目标 host 列表：尽量覆盖“绑定到 lan_ipaddr/容器 IP/0.0.0.0”的固件
+        eth0_ip=\"\$(ip -4 -o addr show dev eth0 2>/dev/null | awk '{print \$4}' | cut -d/ -f1 | head -n1 || true)\"
+        hosts=\"127.0.0.1 localhost\"
+        if [[ -n \"\${eth0_ip}\" ]]; then
+          hosts=\"\${hosts} \${eth0_ip}\"
+        fi
+        hosts=\"\${hosts} 192.168.1.1 192.168.0.1 192.168.50.1 10.0.0.1\"
+
+        listeners=\"\$(detect_listeners | head -n 50 || true)\"
+
+        # 端口优先级：先从监听列表提取；否则回退常见端口
+        ports=\"\$(echo \"\${listeners}\" | awk '{print \$2}' | tr '\\n' ' ' | sort -n | uniq)\"
         if [[ -z \"\$ports\" ]]; then
           ports=\"80 443 8080\"
         fi
 
         for p in \$ports; do
-          # HTTP 优先
-          if try_curl \"http://127.0.0.1:\${p}/\" \"curl_http_\${p}\"; then ok=1; break; fi
-          # HTTPS 兜底
-          if try_curl_k \"https://127.0.0.1:\${p}/\" \"curl_https_\${p}\"; then ok=1; break; fi
+          for h in \$hosts; do
+            if try_curl \"http://\${h}:\${p}/\" \"curl_http_\${h}_\${p}\"; then ok=1; break; fi
+            if try_curl_k \"https://\${h}:\${p}/\" \"curl_https_\${h}_\${p}\"; then ok=1; break; fi
+          done
+          if [[ \"\$ok\" == \"1\" ]]; then
+            break
+          fi
         done
 
         if [[ \"\$ok\" == \"1\" ]]; then

@@ -1,0 +1,3 @@
+# batch_single_rt_ac1200g.txt
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200G_300438250624/rootfs/usr/sbin/httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/asus_latest/FW_RT_AC1200G_300438250624/rootfs
+

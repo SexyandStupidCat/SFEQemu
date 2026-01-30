@@ -145,6 +145,9 @@ local CFG = {
 --
 -- 说明：这些号以 ARM EABI 为准（与本项目已有日志一致：socket=281, connect=283, openat=322）。
 local SYSCALL_NUM_TO_NAME = {
+    -- ARM EABI: execve=11 / execveat=387（仅观测：打印命令行，不拦截）
+    [11] = "execve",
+    [387] = "execveat",
     [289] = "send",
     [290] = "sendto",
     [291] = "recv",
@@ -153,6 +156,12 @@ local SYSCALL_NUM_TO_NAME = {
     [297] = "recvmsg",
     -- ARM EABI: mmap2=192（大量动态链接/库加载会用到；/dev/nvram 也依赖 mmap2）
     [192] = "mmap2",
+    -- ARM EABI: close_range=436（daemonize 常用：一次性关闭大量 fd；需保护 QEMU 内部 fd）
+    [436] = "close_range",
+    -- ARM EABI: pselect6=335（很多固件用它当 sleep；若卡在“长睡眠循环”需要可观测/可触发 AI）
+    [335] = "pselect6",
+    -- ARM EABI: _newselect=142（部分固件用它当 sleep；若未映射会导致日志/死循环检测/AI 触发链断裂）
+    [142] = "select",
 }
 
 -- cache/：用于落盘 syscall 上下文、死循环报告、AI 快照与稳定规则等
@@ -188,6 +197,10 @@ local state = {
         last_report_path = nil,
         seq_len = nil,
         repeats = nil,
+        -- “长睡眠循环”检测：常见形态为 pselect6(nfds=0, timeout=~10s) 反复调用
+        sleep_detected = false,
+        sleep_count = 0,
+        sleep_repeats = nil,
     },
 }
 
@@ -198,6 +211,9 @@ local function reset_loop_state()
     state.loop.last_report_path = nil
     state.loop.seq_len = nil
     state.loop.repeats = nil
+    state.loop.sleep_detected = false
+    state.loop.sleep_count = 0
+    state.loop.sleep_repeats = nil
 end
 
 local function invalidate_handler(syscall_name)
@@ -513,6 +529,42 @@ local function dump_deadloop_report(seq_len, repeats)
 end
 
 local function check_status(ctx)
+    -- 额外：长睡眠循环（不属于“短时间高频重复”，但会导致 httpd 永远不启动）
+    --
+    -- 典型：pselect6(nfds=0, timeout=10s) 被当作 sleep() 使用，反复等待某个永远不会满足的条件。
+    -- 这里用“次数阈值”触发一次 AI 干预，避免一直挂起且无法被 deadloop/idle_watchdog 捕捉。
+    do
+        if type(ctx) == "table" and type(ctx.args) == "table" then
+            -- 注意：ARM 上 syscall 142 为 _newselect，但有些 QEMU 映射表会把它展示为 select 或直接缺失 name。
+            -- 只要识别到“nfds=0 的 select/pselect6”，就把它视为 sleep 型等待并计数。
+            local is_sleep_like = (ctx.name == "pselect6") or (ctx.name == "select") or (ctx.name == "_newselect")
+            if is_sleep_like then
+                local nfds = tonumber(ctx.args[1]) or -1
+                if nfds == 0 then
+                    state.loop.sleep_count = (tonumber(state.loop.sleep_count) or 0) + 1
+                    local th = tonumber(rawget(_G, "SFEMU_SLEEP_LOOP_SELECT_REPEATS"))
+                        or tonumber(rawget(_G, "SFEMU_SLEEP_LOOP_PSELECT6_REPEATS"))
+                        or 2
+                    if th < 1 then
+                        th = 1
+                    end
+                    if state.loop.sleep_count >= th then
+                        state.loop.sleep_detected = true
+                        state.loop.sleep_repeats = state.loop.sleep_count
+                        state.loop.sleep_count = 0
+                        log("检测到疑似长睡眠循环：%s(nfds=0) repeats=%d", tostring(ctx.name), tonumber(state.loop.sleep_repeats) or th)
+                        return false
+                    end
+                    return true
+                end
+            end
+        end
+        -- 只要不是 nfds=0 的 select/pselect6，就清空计数
+        state.loop.sleep_count = 0
+        state.loop.sleep_detected = false
+        state.loop.sleep_repeats = nil
+    end
+
     local seq_len, repeats = detect_repeating_sequence(state.keys, CFG.loop_max_seq_len, CFG.loop_min_repeats)
     if not seq_len then
         reset_loop_state()
@@ -953,9 +1005,11 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
         -- 关键：若 AI 已应用修复规则且允许自动继续，则触发 re-exec 重新运行目标程序，
         -- 否则本次 exit/exit_group 会直接把 QEMU 进程带走，无法完成“重试验证”。
         local applied_fix = (type(res) == "table" and type(res.applied_fix_syscalls) == "table") and #res.applied_fix_syscalls or 0
-        if applied_fix > 0 and type(res) == "table" and res.auto_continue == true and reexec_on_exit_fix_enabled() then
+        local applied_actions = (type(res) == "table" and tonumber(res.applied_actions_count)) or 0
+        local need_reexec = (applied_fix > 0) or (applied_actions > 0)
+        if need_reexec and type(res) == "table" and res.auto_continue == true and reexec_on_exit_fix_enabled() then
             if type(c_request_reexec) == "function" then
-                log("exit：AI 已应用修复规则（%d 个），触发 re-exec 重新加载镜像并重试验证", applied_fix)
+                log("exit：AI 已应用修复（规则=%d 动作=%d），触发 re-exec 重新加载镜像并重试验证", applied_fix, applied_actions)
                 pcall(c_request_reexec, tostring(res.run_id or ""))
                 -- 不拦截 exit：让 C 侧看到“需要 re-exec”后立刻 execv 重新跑；拦截 exit 会导致 guest 走到不可预期分支/反复 exit。
                 return false, 0
@@ -980,14 +1034,16 @@ function entry(syscall_name, num, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8
 
             local res = nil
             local ai_on = need_ai(_G._sfemu_syscall_ctx)
-            log("deadloop 触发：need_ai=%s", tostring(ai_on))
+            local reason = (state.loop.sleep_detected == true) and "sleep_loop" or "deadloop"
+            log("%s 触发：need_ai=%s", tostring(reason), tostring(ai_on))
             if ai_on then
                 res = ai_handle(_G._sfemu_syscall_ctx, {
-                    reason = "deadloop",
+                    reason = reason,
                     loop_seq_len = state.loop.seq_len,
                     loop_repeats = state.loop.repeats,
                     loop_report_path = state.loop.last_report_path,
                     loop_names = loop_names,
+                    sleep_repeats = state.loop.sleep_repeats,
                 })
             end
             if type(res) == "table" and res.auto_continue == true then

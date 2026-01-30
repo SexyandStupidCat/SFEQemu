@@ -132,12 +132,28 @@ EOF
 set -eu
 
 SCRIPT_DIR="\$(cd "\$(dirname "\$0")" && pwd)"
-cd "\$SCRIPT_DIR"
 
-OUT_DIR="\${SFANALYSIS_OUT_DIR:-out_httpd}"
+OUT_DIR="\${SFANALYSIS_OUT_DIR:-\${SCRIPT_DIR}/out_httpd}"
 mkdir -p "\$OUT_DIR"
 
-exec ./qemu-arm -L . -rules ./rules_examples/ -rules-ctx-keep 256 -rules-idle-ms 1000 \\
+# 很多固件（尤其 ASUS）会把“当前工作目录”当作 web 根目录，并用相对路径去打开页面/静态资源。
+# 若在 / 启动，会出现：访问 / 能返回（通常是内置 CGI），但 /QIS_wizard.htm、/images/*、/*.css 全部 404。
+# 优先把 cwd 切到 webroot（可通过 SFEMU_WEBROOT 手工覆盖）。
+WEBROOT="\${SFEMU_WEBROOT:-}"
+if [ -z "\$WEBROOT" ]; then
+  if [ -d "\${SCRIPT_DIR}/www" ]; then
+    WEBROOT="\${SCRIPT_DIR}/www"
+  elif [ -d "\${SCRIPT_DIR}/var/www" ]; then
+    WEBROOT="\${SCRIPT_DIR}/var/www"
+  elif [ -d "\${SCRIPT_DIR}/home/httpd" ]; then
+    WEBROOT="\${SCRIPT_DIR}/home/httpd"
+  else
+    WEBROOT="\${SCRIPT_DIR}"
+  fi
+fi
+cd "\$WEBROOT" 2>/dev/null || cd "\${SCRIPT_DIR}"
+
+exec "\${SCRIPT_DIR}/qemu-arm" -L "\${SCRIPT_DIR}" -rules "\${SCRIPT_DIR}/rules_examples/" -rules-ctx-keep 256 -rules-idle-ms 1000 \\
   -shadowstack log=off,summary=on,unwind_limit=100,max_stack=100 \\
   -sfanalysis "\$OUT_DIR" "${httpd_in_guest}"
 EOF

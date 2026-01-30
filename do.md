@@ -60,4 +60,16 @@
 - `httpd` 进程完成了 NVRAM/SSL 初始化并写入 `/var/run/httpd.pid`，随后日志停滞（可能进入未映射 syscall 或用户态忙等）。
 - 当前 `linux-user/syscall.c:get_syscall_name()` 仅白名单少量 syscall，很多 syscall 名为 `nil` 时 entry/finish 不落盘，导致排查盲区。
 
+#### 新发现：Web UI “根路径有回包但所有页面 404”
+
+- 复现固件：`FW_RT_AC1300UHP_30043808375`
+- 现象：
+  - `/` 返回 200（JS 重定向到 `/QIS_wizard.htm?...`）
+  - 但 `/QIS_wizard.htm`、`/images/*`、`/qis/*.css` 等全部 404
+- 根因：ASUS `httpd/2.0` 会把“当前工作目录”当作 webroot，并用相对路径打开资源；我们原先在固件根目录启动，导致资源都找不到。
+- 修复：
+  - 生成的 `start.sh` 改为优先 `cd /www`（可用 `SFEMU_WEBROOT` 覆盖）
+  - 同时把 `qemu-arm/-rules/-sfanalysis` 统一改为绝对路径，并保持 `-L` 指向固件根目录
+  - 结果：`/QIS_wizard.htm`、`/images/favicon.png`、`/qis/qis_style.css` 均恢复 200。
+
 （每个固件的结果将记录：启动命令、curl 结果、关键错误点、是否新增“通用规则/固件特定规则”。）

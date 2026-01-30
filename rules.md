@@ -59,6 +59,15 @@
   - `SFEMU_LOG_UNKNOWN_SYSCALLS=1`
   - 使未映射 syscall 也会以 `sys_<num>` 的形式进入 entry/finish 流程（仅观测，不做规则加载/AI 修复）。
 
+### 1.8 Web UI 全 404：httpd 的 webroot 依赖 cwd
+
+- 现象：`curl http://127.0.0.1/` 有回包（常见是内置 CGI 返回 JS 重定向），但访问任何静态资源/页面都 404：
+  - `/QIS_wizard.htm`、`/images/*`、`/*.css`、`/*.js`、`/*.asp` 等
+- 原因：不少固件（尤其 ASUS 的 `httpd/2.0`）会把“当前工作目录”当作 web 根目录，并用相对路径打开资源。
+  如果我们在 `/` 启动它，而真正的 webroot 在 `/www`，就会出现“根路径能返回但所有文件 404”的假成功。
+- 策略：启动时把 cwd 切到 webroot（优先 `/www`），同时用绝对路径运行 `qemu-arm` 并保持 `-L` 指向固件根。
+  - 批量脚本已内置：`lab/run_batch_001.sh` 会在生成的 `start.sh` 里自动选择 webroot（也可用 `SFEMU_WEBROOT` 覆盖）。
+
 ## 2. 规则收敛方法（每 10 个固件执行一次）
 
 1. 统计失败原因 TopN（ENOENT/EINVAL/EPROTONOSUPPORT…）与高频路径（cert.pem、nvram、/var/run…）

@@ -45,6 +45,16 @@
   最终进入 “nfds=0 的 select 等待” 分支（不会对外提供服务）。
 - 修复（通用）：`rules_examples/base/nvram.lua` 将默认 `http_enable` 改为 `"0"`（启用 HTTP）。
 
+### 1.4 MTD/Flash 信息缺失（/proc/mtd、/dev/mtd*）
+
+- 现象：部分固件的 Web 服务（如 `boa` / `mini_httpd`）会读取 `/proc/mtd` 或打开 `/dev/mtd*` 来判断 flash 分区；
+  在容器/chroot 里常见为 `ENOENT`，进而进入异常路径（自旋/退出/不监听）。
+- 策略（通用兜底）：
+  - `open/openat`：对 `/proc/mtd`、`/dev/mtd*` 先尝试真实 syscall；若 `ENOENT`，映射到 host 的 `/dev/zero` 返回可用 fd
+  - `read`：对 `/proc/mtd` 返回最小固定文本；对 `/dev/mtd*` 返回全 0 数据
+  - `lseek`：对 `/proc/mtd` 维护读偏移（避免程序 `lseek()` 后解析错位）
+- 文件：`rules_examples/base/mtd.lua`、`rules_examples/syscall/open.lua`、`rules_examples/syscall/openat.lua`、`rules_examples/syscall/read.lua`、`rules_examples/syscall/lseek.lua`
+
 ### 1.4 /dev/log 缺失（syslog socket）
 
 - 现象：`connect("/dev/log") = -ENOENT`，部分固件会因此异常退出。

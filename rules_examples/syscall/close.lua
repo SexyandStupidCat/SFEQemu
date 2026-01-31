@@ -5,6 +5,7 @@ local script_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or ""
 local rules_dir = script_dir:gsub("syscall/?$", "")
 local fakefile = require(rules_dir .. "plugins/fakefile")
 local fdmap = require(rules_dir .. "base/fdmap")
+local mtd = require(rules_dir .. "base/mtd")
 
 function do_syscall(num, fd, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
     -- 重要：很多固件 daemonize 时会批量 close(0..N)，这会把 QEMU 侧用于日志/框架的内部 fd 也关掉，
@@ -19,6 +20,12 @@ function do_syscall(num, fd, arg2, arg3, arg4, arg5, arg6, arg7, arg8)
             c_log("[close.protect] ignore close(fd=3) to keep sfemu log alive")
         end
         return 1, 0
+    end
+
+    -- /proc/mtd：清理 read offset
+    local info = fdmap.get(tonumber(fd) or -1)
+    if type(info) == "table" and info.path == "/proc/mtd" then
+        mtd.unmark_fd(fd)
     end
 
     local action, ret = fakefile.handle_close(num, fd, arg2, arg3, arg4, arg5, arg6, arg7, arg8)

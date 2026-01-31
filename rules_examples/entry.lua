@@ -879,6 +879,13 @@ local function manual_handle(ctx)
         reset_loop_state()
         return
     end
+    -- 批量/无人值守模式：不允许阻塞等待人工输入
+    local np = rawget(_G, "SFEMU_NO_PROMPT")
+    if np == true or np == 1 or tostring(np) == "1" or tostring(np) == "true" or tostring(np) == "on" then
+        log("SFEMU_NO_PROMPT=1：跳过人工确认（不再等待 YES）")
+        reset_loop_state()
+        return
+    end
     if type(c_wait_user_continue) == "function" then
         c_wait_user_continue("检测到仿真异常/死循环，输入 YES 继续运行: ")
         reset_loop_state()

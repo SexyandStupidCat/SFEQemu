@@ -1,0 +1,2 @@
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/linksys_latest/FW_E2100L_1.0.05.004_20120308_code/rootfs/usr/sbin/mini_httpd /media/user/ddisk/Work/FirmAE/firmwares/dataset/linksys_latest/FW_E2100L_1.0.05.004_20120308_code/rootfs
+/media/user/ddisk/Work/FirmAE/firmwares/dataset/trendnet_latest/TEW-432BRP_3.10B20/rootfs/bin/boa /media/user/ddisk/Work/FirmAE/firmwares/dataset/trendnet_latest/TEW-432BRP_3.10B20/rootfs

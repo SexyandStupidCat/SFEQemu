@@ -130,3 +130,13 @@
   - 宿主机访问 `http://127.0.0.1:18081/` 与 `http://127.0.0.1:18081/QIS_wizard.htm?flag=welcome` 均返回 200
   - 静态资源 `/images/favicon.png`、`/qis/qis_style.css` 也返回 200
   - 容器保持运行，未再出现访问即退出的情况
+
+#### 新增通用兜底：/proc/mtd 与 /dev/mtd*
+
+- 时间：2026-01-31
+- 背景：部分固件（例如 `boa`/`mini_httpd`）会读取 flash 分区信息；在容器/chroot 环境里 `/proc/mtd`、`/dev/mtd*` 往往缺失。
+- 处理：增加最小 MTD 仿真（让服务能继续启动、进入监听）
+  - `open/openat`：若 `ENOENT`，将 `/proc/mtd`、`/dev/mtd*` 映射到 `/dev/zero` 返回可用 fd
+  - `read`：对 `/proc/mtd` 返回最小固定文本；对 `/dev/mtd*` 返回全 0
+  - `lseek`：对 `/proc/mtd` 维护偏移
+- 文件：`rules_examples/base/mtd.lua`、`rules_examples/syscall/open.lua`、`rules_examples/syscall/openat.lua`、`rules_examples/syscall/read.lua`、`rules_examples/syscall/lseek.lua`

@@ -4,6 +4,7 @@
 local script_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or ""
 local rules_dir = script_dir:gsub("syscall/?$", "")
 local nvram = require(rules_dir .. "base/nvram")
+local mtd = require(rules_dir .. "base/mtd")
 local fakefile = require(rules_dir .. "plugins/fakefile")
 local fdmap = require(rules_dir .. "base/fdmap")
 
@@ -13,6 +14,14 @@ function do_syscall(num, fd, buf, count, arg4, arg5, arg6, arg7, arg8)
 
     -- /dev/nvram：优先兼容（避免 nvram_get() 返回 NULL）
     local action, retval = nvram.handle_read(num, fd, buf, count, arg4, arg5, arg6, arg7, arg8)
+    if action == 1 then
+        return action, retval
+    end
+
+    -- /proc/mtd 与 /dev/mtd*：基于 fdmap.path 做最小仿真
+    local info = fdmap.get(tonumber(fd) or -1)
+    local path = (type(info) == "table" and info.path) or nil
+    local action, retval = mtd.handle_read(fd, path, buf, count)
     if action == 1 then
         return action, retval
     end

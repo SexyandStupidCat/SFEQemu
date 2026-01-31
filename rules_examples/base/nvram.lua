@@ -27,7 +27,12 @@ local M = {}
 local PROT_READ = 0x1
 local PROT_WRITE = 0x2
 local MAP_PRIVATE = 0x2
+-- 不同架构的 MAP_ANONYMOUS 位可能不同：
+-- - 常见：0x20
+-- - MIPS(o32) 常见：0x800
+-- 这里在 mmap 兜底时会“尝试多个候选位”，避免匿名映射失败（常见为 -EBADF）。
 local MAP_ANONYMOUS = 0x20
+local MAP_ANONYMOUS_MIPS = 0x800
 
 local function log(fmt, ...)
     if type(c_log) ~= "function" then
@@ -180,8 +185,18 @@ function M.handle_mmap(num, addr, length, prot, flags, fd, offset, arg7, arg8)
 
     -- 用匿名映射代替设备映射：让固件能拿到一段可读内存作为“nvram 数据区”
     local new_prot = prot | PROT_WRITE -- 便于填充；比起读不到更重要
-    local new_flags = MAP_PRIVATE | MAP_ANONYMOUS
-    local base = c_do_syscall(num, addr, length, new_prot, new_flags, -1, 0, arg7 or 0, arg8 or 0)
+    -- 注意：这里是在“guest ABI”层面构造参数给 c_do_syscall，因此 MAP_ANONYMOUS 位必须匹配目标架构；
+    -- 若位不匹配，匿名映射会退化为“文件映射(fd=-1)”从而返回 -EBADF。
+    local base = -22 -- -EINVAL
+    local anon_candidates = { MAP_ANONYMOUS, MAP_ANONYMOUS_MIPS }
+    for _, anon in ipairs(anon_candidates) do
+        local new_flags = MAP_PRIVATE | anon
+        -- 额外参数强制清零，避免把来路不明的寄存器值透传给内核侧 syscall
+        base = c_do_syscall(num, addr, length, new_prot, new_flags, -1, 0, 0, 0)
+        if type(base) == "number" and base >= 0 then
+            break
+        end
+    end
     if type(base) ~= "number" or base < 0 then
         log("mmap 失败：ret=%s len=%d", tostring(base), length)
         return 1, base

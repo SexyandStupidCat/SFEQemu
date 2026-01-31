@@ -5,9 +5,11 @@ local script_dir = debug.getinfo(1, "S").source:match("@?(.*/)") or ""
 local rules_dir = script_dir:gsub("syscall/?$", "")
 local fakefile = require(rules_dir .. "plugins/fakefile")
 local fdmap = require(rules_dir .. "base/fdmap")
+local mtd = require(rules_dir .. "base/mtd")
 
 local O_CREAT = 0x40
 local AT_FDCWD = -100
+local ENOENT = -2
 
 local function dirname(path)
     local p = tostring(path or "")
@@ -124,6 +126,49 @@ function do_syscall(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, arg8)
             return 1, ret
         end
         -- 兜底：旧二进制无 c_open_host 时继续走原逻辑（可能失败）
+    end
+
+    -- /proc/mtd 与 /dev/mtd*：最小兜底（缺失时映射到 /dev/zero，并在 read() 时伪造内容）。
+    if path == "/proc/mtd" or (type(path) == "string" and path:match("^/dev/mtd")) then
+        if type(c_do_syscall) == "function" and type(c_open_host) == "function" then
+            local real_ret = c_do_syscall(num, dirfd, pathname, flags, mode, arg5 or 0, arg6 or 0, arg7 or 0, arg8 or 0)
+            if type(real_ret) == "number" and real_ret >= 0 then
+                fdmap.set(real_ret, {
+                    kind = classify_path(path),
+                    path = path,
+                    flags = flags or 0,
+                    mode = mode or 0,
+                    is_fake = false,
+                })
+                if path == "/proc/mtd" then
+                    mtd.mark_fd(real_ret)
+                end
+                return 1, real_ret
+            end
+            if type(real_ret) == "number" and real_ret ~= ENOENT then
+                return 1, real_ret
+            end
+
+            local fd = c_open_host("/dev/zero", flags, mode)
+            if type(fd) == "number" and fd >= 0 then
+                fdmap.set(fd, {
+                    kind = classify_path(path),
+                    path = path,
+                    flags = flags or 0,
+                    mode = mode or 0,
+                    is_fake = true,
+                })
+                if path == "/proc/mtd" then
+                    mtd.mark_fd(fd)
+                end
+                c_log(string.format("[openat.mtd] mapped %s to /dev/zero fd=%d", path, fd))
+                return 1, fd
+            end
+            if type(fd) == "number" then
+                c_log(string.format("[openat.mtd] c_open_host failed ret=%d", fd))
+                return 1, fd
+            end
+        end
     end
 
     local action, ret = fakefile.handle_openat(num, dirfd, pathname, flags, mode, arg5, arg6, arg7, arg8)
